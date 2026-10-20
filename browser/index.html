@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="mediumDark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VectorCraft</title>
+  <link rel="icon" href="/assets/app-icon/hicolor/32x32/apps/ai.storyteller.vectorcraft.png" />
+  <link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="appbar" id="appbar"></header>
+    <div class="tabstrip" id="tabstrip"></div>
+    <div class="controlbar" id="controlbar" hidden></div>
+    <div class="workspace-body">
+      <aside class="toolbar" id="toolbar"></aside>
+      <div class="stage" id="stage">
+        <div class="ruler-row" id="ruler-row">
+          <div class="ruler-corner"></div>
+          <div class="ruler h" id="ruler-h"></div>
+        </div>
+        <div class="canvas-row">
+          <div class="ruler v" id="ruler-v"></div>
+          <div class="canvas" id="canvas">
+            <svg class="art" id="art" xmlns="http://www.w3.org/2000/svg"></svg>
+            <svg class="overlay" id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div class="taskbar" id="taskbar" hidden></div>
+          </div>
+        </div>
+      </div>
+      <aside class="dock" id="dock">
+        <div class="rail" id="rail"></div>
+        <div class="panel" id="panel">
+          <div class="ptabs" id="ptabs"></div>
+          <div class="pbody" id="pbody"></div>
+        </div>
+      </aside>
+    </div>
+    <div class="hintbar" id="hintbar"></div>
+    <footer class="statusbar" id="statusbar"></footer>
+  </div>
+  <script>
+    window.addEventListener("error", (e) => {
+      const d = document.createElement("div");
+      d.className = "toast";
+      d.style.display = "block";
+      d.textContent = e.message || "Something went wrong";
+      document.body.appendChild(d);
+    });
+  </script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
