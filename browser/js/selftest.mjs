@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
-import { renderDocument } from "./render.js";
+import { renderDocument, repeatTransforms } from "./render.js";
 import { loadFile } from "./model.js";
-import { parseFace, outlineGlyphs } from "./outlines.js";
+import { warpDocPoint } from "./geom.js";
+import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];
@@ -23,11 +24,40 @@ const neon = loadFile(readFileSync(new URL("../../examples/neon-drive.vectorcraf
 const ns = renderDocument(neon);
 console.log("neon body", ns.body.length, "text", ns.body.includes("NEON DRIVE"), "glow", ns.defs.includes("feGaussianBlur"));
 
-const feat = loadFile(readFileSync(new URL("../../examples/feature-sheet.vectorcraft", import.meta.url)));
-const fs = renderDocument(feat);
-console.log("feature body", fs.body.length, "mesh polys", (fs.body.match(/<path /g) || []).length);
-
 const font = readFileSync(new URL("../../assets/fonts/SourceSans3-Bold.ttf", import.meta.url));
 const face = parseFace(font.buffer.slice(font.byteOffset, font.byteOffset + font.byteLength));
 const outlined = outlineGlyphs(face, "NO", { size: 100, tracking: 0 }, [1, 0, 0, 1, 0, 0], "Left");
 console.log("outline glyphs", outlined.paths.length, "O contours", outlined.paths[1].subpaths.length);
+rememberFace("Source Sans 3", "Bold", face);
+
+const feat = loadFile(readFileSync(new URL("../../examples/feature-sheet.vectorcraft", import.meta.url)));
+const fs = renderDocument(feat);
+const polys = (fs.body.match(/<path /g) || []).length;
+console.log("feature body", fs.body.length, "mesh polys", polys, "WARP text", fs.body.includes(">WARP<"));
+if (fs.body.includes(">WARP<")) throw new Error("envelope left WARP as unwarped text");
+if (polys < 8000) throw new Error("mesh tessellation coarser than the desktop renderer");
+if (!fs.body.includes("Envelope Distort")) throw new Error("labels should stay as text");
+
+const warp = outlineGlyphs(face, "WARP", { size: 150, tracking: 40 }, [1, 0, 0, 1, 910, 1150], "Left");
+const src = { x0: 880, y0: 930, x1: 1340, y1: 1290 };
+const p = warp.paths[0].subpaths[0].anchors[0].p;
+const q = warpDocPoint(p, src, "flag", 45, 0, 0, true);
+const needle = `${Math.round(q.x * 1000) / 1000} ${Math.round(q.y * 1000) / 1000}`;
+console.log("warped anchor", needle, "moved", Math.hypot(q.x - p.x, q.y - p.y).toFixed(2));
+if (!fs.body.includes(needle)) throw new Error("flag warp did not bend the glyph outline");
+if (Math.hypot(q.x - p.x, q.y - p.y) < 1) throw new Error("flag bend did not move the glyph");
+
+const spin = repeatTransforms(
+  { type: "radial", instances: 12, radius: 135, center: { x: 350, y: 1090 }, startAngle: 0, endAngle: 360 },
+  { x0: 350, y0: 860, x1: 350, y1: 1050 },
+);
+if (spin.length !== 12) throw new Error("radial instances");
+const id = spin[0].every((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) < 1e-6);
+if (!id) throw new Error("source already on the radius should not slide: " + spin[0]);
+const grid = repeatTransforms(
+  { type: "grid", rows: 2, cols: 2, hSpacing: 10, vSpacing: 10 },
+  { x0: 0, y0: 0, x1: 10, y1: 10 },
+);
+if (grid.length !== 4 || Math.abs(grid[3][4] - 20) > 1e-6 || Math.abs(grid[3][5] - 20) > 1e-6) {
+  throw new Error("grid repeat: " + JSON.stringify(grid[3]));
+}

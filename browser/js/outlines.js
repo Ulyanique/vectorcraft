@@ -9,6 +9,17 @@ import { fontUrl } from "./fontmetrics.js";
 const faces = new Map();
 const pending = new Map();
 
+/** A face already parsed this session, or null. Envelope paint uses this so it can warp type without waiting. */
+export function cachedFace(family, style) {
+  return faces.get(fontUrl(family, style)) || null;
+}
+
+/** Seed the cache (tests, or a face parsed outside `loadFace`). */
+export function rememberFace(family, style, face) {
+  faces.set(fontUrl(family, style), face);
+  return face;
+}
+
 export function loadFace(family, style) {
   const url = fontUrl(family, style);
   if (faces.has(url)) return Promise.resolve(faces.get(url));

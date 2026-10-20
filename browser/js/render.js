@@ -1,10 +1,11 @@
 /** Paint a VectorCraft document to an SVG string. */
 
 import {
-  applyXf, flattenPath, hitStroke, ident, lerp, lerpColor, meshColor, meshEval, pathD, rgbCss, toRgb,
-  warpDocPoint, mapPath, pathBounds, union,
+  applyXf, flattenPath, hitStroke, ident, lerp, lerpColor, meshColor, meshEval, mulXf, pathD, rgbCss,
+  rotateXf, toRgb, translateXf, warpDocPoint, mapPath, pathBounds, union,
 } from "./geom.js";
 import { childrenOf, nodeBounds } from "./model.js";
+import { cachedFace, outlineGlyphs } from "./outlines.js";
 
 let gid = 1;
 function nextId(prefix) { return `${prefix}${gid++}`; }
@@ -13,11 +14,19 @@ export function renderDocument(file, opts = {}) {
   gid = 1;
   const mode = opts.mode || "preview";
   const defs = [];
+  const fontMisses = [];
+  const seen = new Set();
+  const noteFont = (family, style) => {
+    const key = `${family}\0${style}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    fontMisses.push({ family, style });
+  };
   const body = [];
   for (const layer of file.document.layers || []) {
-    body.push(renderNode(layer, { defs, mode, opacity: 1 }));
+    body.push(renderNode(layer, { defs, mode, opacity: 1, noteFont }));
   }
-  return { defs: defs.join(""), body: body.join("") };
+  return { defs: defs.join(""), body: body.join(""), fontMisses };
 }
 
 function renderNode(node, ctx) {
@@ -315,11 +324,29 @@ function lerpPaint(a, b, t) {
   return t < 0.5 ? a : b;
 }
 
+/** Subdivisions per patch. Desktop uses ceil(patch_px / 5), clamped 2..32; document units stand in for 100% zoom. */
+function meshLevel(pts, rows, cols) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const pt of pts) {
+    const p = pt.p;
+    if (!p) continue;
+    x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y);
+    x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+    for (const h of pt.handles || []) {
+      x0 = Math.min(x0, p.x + h.x); y0 = Math.min(y0, p.y + h.y);
+      x1 = Math.max(x1, p.x + h.x); y1 = Math.max(y1, p.y + h.y);
+    }
+  }
+  const size = Math.max(x1 - x0, y1 - y0, 1);
+  const per = size / Math.max(rows, cols, 1);
+  return Math.max(2, Math.min(32, Math.ceil(per / 5)));
+}
+
 function renderMesh(node, k, ctx) {
   const rows = k.rows | 0, cols = k.cols | 0;
   const pts = k.points || [];
   if (!rows || !cols || pts.length < (rows + 1) * (cols + 1)) return "";
-  const N = 8;
+  const N = meshLevel(pts, rows, cols);
   const parts = [];
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
@@ -341,29 +368,82 @@ function renderMesh(node, k, ctx) {
   void ctx;
 }
 
-function renderRepeat(node, k, ctx) {
-  const spec = k.kind || {};
-  const sources = k.source || [];
-  if (spec.type !== "radial") {
-    return sources.map((s) => renderNode(s, ctx)).join("");
-  }
-  const n = spec.instances || 1;
+/** Instance matrices (source → document), in paint order. Matches `repeat_transforms`. */
+export function repeatTransforms(spec, bounds) {
+  const b = bounds || { x0: 0, y0: 0, x1: 1, y1: 1 };
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  if (spec?.type === "radial") return radialTransforms(spec, cx, cy);
+  if (spec?.type === "grid") return gridTransforms(spec, b);
+  if (spec?.type === "mirror") return [ident(), reflectAbout(spec.center || { x: cx, y: cy }, spec.angle || 0)];
+  return [ident()];
+}
+
+function radialTransforms(spec, cx, cy) {
+  const n = Math.max(1, Math.min(1000, spec.instances || 1));
   const center = spec.center || { x: 0, y: 0 };
+  let dx = cx - center.x, dy = cy - center.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) { dx = 0; dy = -1; }
+  else { dx /= len; dy /= len; }
+  const radius = Math.max(0, spec.radius || 0);
+  // Keep the source's centre `radius` from the repeat centre, then spin.
+  const pre = translateXf(center.x + dx * radius - cx, center.y + dy * radius - cy);
   const start = (spec.startAngle || 0) * Math.PI / 180;
   const end = (spec.endAngle ?? 360) * Math.PI / 180;
   const sweep = end - start;
-  const parts = [];
-  for (let i = 0; i < n; i++) {
-    const t = n === 1 ? 0 : i / n;
-    const ang = start + sweep * t;
-    const co = Math.cos(ang), si = Math.sin(ang);
-    // rotate around center: translate, rotate, translate back
-    const tf = `translate(${center.x} ${center.y}) rotate(${ang * 180 / Math.PI}) translate(${-center.x} ${-center.y})`;
-    const inner = sources.map((s) => renderNode(s, ctx)).join("");
-    parts.push(`<g transform="${tf}">${inner}</g>`);
-    void co; void si;
+  const full = Math.abs(Math.abs(sweep) - Math.PI * 2) < 1e-6;
+  const step = full || n === 1 ? sweep / n : sweep / (n - 1);
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(mulXf(rotateXf(start + step * i, center.x, center.y), pre));
+  if (spec.reverseOverlap) out.reverse();
+  return out;
+}
+
+function gridTransforms(spec, b) {
+  const rows = Math.max(1, Math.min(500, spec.rows || 3));
+  const cols = Math.max(1, Math.min(500, spec.cols || 3));
+  const w = Math.max(1e-3, (b.x1 - b.x0) + (spec.hSpacing || 0));
+  const h = Math.max(1e-3, (b.y1 - b.y0) + (spec.vSpacing || 0));
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  const out = [];
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      const o = tileOffset(spec.gridType, w, h, i, j);
+      let flip = ident();
+      if (spec.flipCols && i % 2 === 1) flip = mulXf(reflectAbout({ x: cx, y: cy }, 90), flip);
+      if (spec.flipRows && j % 2 === 1) flip = mulXf(reflectAbout({ x: cx, y: cy }, 0), flip);
+      out.push(mulXf(translateXf(o.x, o.y), flip));
+    }
   }
-  if (spec.reverseOverlap) parts.reverse();
+  return out;
+}
+
+function tileOffset(tt, w, h, i, j) {
+  const type = tt?.type || "grid";
+  const offset = tt?.offset ?? 0.5;
+  const frac = (v) => v - Math.floor(v);
+  if (type === "brickByRow") return { x: i * w + frac(j * offset) * w, y: j * h };
+  if (type === "brickByColumn") return { x: i * w, y: j * h + frac(i * offset) * h };
+  if (type === "hexByColumn") return { x: i * w * 0.75, y: j * h + (i % 2 === 1 ? h / 2 : 0) };
+  if (type === "hexByRow") return { x: i * w + (j % 2 === 1 ? w / 2 : 0), y: j * h * 0.75 };
+  return { x: i * w, y: j * h };
+}
+
+function reflectAbout(c, deg) {
+  const t = 2 * deg * Math.PI / 180;
+  const s2 = Math.sin(t), c2 = Math.cos(t);
+  return mulXf(translateXf(c.x, c.y), mulXf([c2, s2, s2, -c2, 0, 0], translateXf(-c.x, -c.y)));
+}
+
+function renderRepeat(node, k, ctx) {
+  const spec = k.kind || {};
+  const sources = k.source || [];
+  let b = null;
+  for (const s of sources) b = union(b, nodeBounds(s));
+  const parts = repeatTransforms(spec, b).map((xf) => {
+    const inner = sources.map((s) => renderNode(s, ctx)).join("");
+    return `<g transform="matrix(${xf.map(round).join(" ")})">${inner}</g>`;
+  });
   return `<g data-id="${node.id}">${parts.join("")}</g>`;
 }
 
@@ -392,8 +472,9 @@ function renderWarped(node, fn, ctx) {
     return renderNode(clone, ctx);
   }
   if (k.type === "text") {
-    // Warp each glyph roughly by transforming the whole run's origin and drawing as a path-less text
-    // at the warped baseline. Good enough for posters; feature-sheet envelope is paths.
+    // Desktop outlines type, then pushes the glyph paths through the same map as the art.
+    const paths = textAsPaths(node, k, ctx);
+    if (paths) return paths.map((p) => renderWarped(p, fn, ctx)).join("");
     const xf = k.xf || ident();
     const o = fn(applyXf(xf, { x: 0, y: 0 }));
     const clone = JSON.parse(JSON.stringify(node));
@@ -403,6 +484,45 @@ function renderWarped(node, fn, ctx) {
   const kids = childrenOf(node);
   if (kids) return kids.map((c) => renderWarped(c, fn, ctx)).join("");
   return renderNode(node, ctx);
+}
+
+/** Glyph outlines for a text node, or null if a face is not loaded yet. */
+function textAsPaths(node, k, ctx) {
+  const xf = k.xf || ident();
+  const justify = k.para?.justify || "Left";
+  let origin = 0;
+  const out = [];
+  for (const run of k.runs || []) {
+    const st = run.style || {};
+    const family = st.font_family || "Source Sans 3";
+    const style = st.font_style || "Regular";
+    const face = cachedFace(family, style);
+    if (!face) {
+      ctx.noteFont?.(family, style);
+      return null;
+    }
+    const text = st.all_caps ? (run.text || "").toUpperCase() : (run.text || "");
+    const outlined = outlineGlyphs(face, text, st, xf, origin ? "Left" : justify, null, origin);
+    origin += outlined.advance;
+    const items = [];
+    if (!st.fill || st.fill.type !== "none") {
+      items.push({ kind: "fill", paint: st.fill || { type: "solid", color: { model: "rgb", r: 0, g: 0, b: 0 } }, opacity: 1, visible: true });
+    }
+    if (st.stroke?.type && st.stroke.type !== "none" && (st.stroke_width || 0) > 0) {
+      items.push({ kind: "stroke", paint: st.stroke, width: st.stroke_width, opacity: 1, visible: true });
+    }
+    for (const path of outlined.paths) {
+      out.push({
+        id: node.id,
+        visible: true,
+        opacity: node.opacity ?? 1,
+        blend: node.blend,
+        appearance: { items },
+        kind: { type: "path", path },
+      });
+    }
+  }
+  return out;
 }
 
 function withEffects(effects, inner, defs) {

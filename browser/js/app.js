@@ -12,6 +12,7 @@ import {
   solid, textOf, translateNode, transformNode, ungroup, unlockAll, fillsOf,
 } from "./model.js";
 import { loadFontMetrics } from "./fontmetrics.js";
+import { loadFace, outlineGlyphs } from "./outlines.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
@@ -350,6 +351,7 @@ function paint() {
   const d = doc();
   if (!d) { art.innerHTML = ""; $("overlay").innerHTML = ""; return; }
   const rendered = renderDocument(d.file, { mode: ui.outline ? "outline" : "preview" });
+  if (rendered.fontMisses?.length) warmMissedFonts(rendered.fontMisses);
   const boards = (d.file.document.artboards || []).map((a, i) => {
     const r = a.rect, w = r.x1 - r.x0, h = r.y1 - r.y0;
     const on = i === d.artboard;
@@ -802,18 +804,44 @@ function openDoc(f, name) {
   });
 }
 
+let fontWarmKey = "";
+
+function warmMissedFonts(misses) {
+  const key = misses.map((m) => `${m.family}/${m.style}`).join(",");
+  if (fontWarmKey === key) return;
+  fontWarmKey = key;
+  Promise.all(misses.map((m) => loadFace(m.family, m.style).catch(() => null))).then(() => paint());
+}
+
+async function warmType(file) {
+  const jobs = [];
+  const seen = new Set();
+  const walk = (n) => {
+    const k = n?.kind;
+    if (!k) return;
+    if (k.type === "text") {
+      for (const run of k.runs || []) {
+        const st = run.style || {};
+        const key = `${st.font_family || ""}\0${st.font_style || ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        jobs.push(loadFontMetrics(st.font_family, st.font_style).catch(() => {}));
+        jobs.push(loadFace(st.font_family, st.font_style).catch(() => {}));
+      }
+    }
+    for (const c of k.children || k.content || k.source || []) walk(c);
+  };
+  for (const layer of file.document?.layers || []) walk(layer);
+  await Promise.all(jobs);
+}
+
 async function openExample(name) {
   const res = await fetch("/examples/" + name);
   if (!res.ok) throw new Error("Could not load " + name);
   const text = await res.text();
-  if (name.startsWith("neon-drive")) {
-    await Promise.all([
-      loadFontMetrics("Source Sans 3", "Bold"),
-      loadFontMetrics("Source Sans 3", "Semibold"),
-      loadFontMetrics("Source Sans 3", "Regular"),
-    ]).catch(() => {});
-  }
-  openDoc(loadFile(text), name);
+  const file = loadFile(text);
+  await warmType(file);
+  openDoc(file, name);
   if (name.startsWith("neon-drive")) {
     const d = doc();
     const { map } = indexNodes(d.file);
@@ -823,7 +851,7 @@ async function openExample(name) {
   remember(name, text, "example");
 }
 
-function openText(name, text) {
+async function openText(name, text) {
   if (name.endsWith(".svg") || text.trim().startsWith("<")) {
     const f = newFile({ title: name.replace(/\.svg$/i, ""), width: 800, height: 600 });
     const nodes = importSVG(text, f);
@@ -831,7 +859,9 @@ function openText(name, text) {
     openDoc(f, name.replace(/\.svg$/i, "") || "SVG");
     return;
   }
-  openDoc(loadFile(text), name);
+  const file = loadFile(text);
+  await warmType(file);
+  openDoc(file, name);
   remember(name, text, "file");
 }
 
