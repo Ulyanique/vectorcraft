@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
 import { renderDocument } from "./render.js";
 import { loadFile } from "./model.js";
+import { parseFace, outlineGlyphs } from "./outlines.js";
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];
@@ -25,3 +26,8 @@ console.log("neon body", ns.body.length, "text", ns.body.includes("NEON DRIVE"),
 const feat = loadFile(readFileSync(new URL("../../examples/feature-sheet.vectorcraft", import.meta.url)));
 const fs = renderDocument(feat);
 console.log("feature body", fs.body.length, "mesh polys", (fs.body.match(/<path /g) || []).length);
+
+const font = readFileSync(new URL("../../assets/fonts/SourceSans3-Bold.ttf", import.meta.url));
+const face = parseFace(font.buffer.slice(font.byteOffset, font.byteOffset + font.byteLength));
+const outlined = outlineGlyphs(face, "NO", { size: 100, tracking: 0 }, [1, 0, 0, 1, 0, 0], "Left");
+console.log("outline glyphs", outlined.paths.length, "O contours", outlined.paths[1].subpaths.length);

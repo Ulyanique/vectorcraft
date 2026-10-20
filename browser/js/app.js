@@ -927,10 +927,116 @@ function drawTextCanvas(ctx, f) {
 }
 function fontWeight(style) {
   const s = style || "";
+  if (/black|heavy/i.test(s)) return 900;
+  if (/extra.?bold|ultra.?bold/i.test(s)) return 800;
+  if (/semi.?bold|demi/i.test(s)) return 600;
   if (/bold/i.test(s)) return 700;
-  if (/semibold|semi/i.test(s)) return 600;
   if (/medium/i.test(s)) return 500;
+  if (/light/i.test(s)) return 300;
   return 400;
+}
+
+async function shapedAdvances(style, text, face) {
+  if (typeof document === "undefined" || !text) return null;
+  const family = style.font_family || "Source Sans 3";
+  const italic = /italic|oblique/i.test(style.font_style || "") ? "italic" : "normal";
+  const weight = fontWeight(style.font_style);
+  const size = style.size || 16;
+  const tracking = (style.tracking || 0) / 1000 * size;
+  try { await document.fonts.load(`${italic} ${weight} ${size}px "${family}"`); } catch { /* use whatever is installed */ }
+  const ctx = document.createElement("canvas")?.getContext("2d");
+  if (!ctx) return null;
+  ctx.font = `${italic} ${weight} ${size}px "${family}"`;
+  const sample = face.advance(face.glyphOf(72) || face.glyphOf(32) || 0) * size / face.units;
+  if (sample > 1 && Math.abs(ctx.measureText("H").width - sample) / sample > 0.35) return null;
+  const spaced = "letterSpacing" in ctx;
+  if (spaced) ctx.letterSpacing = `${tracking}px`;
+  const src = style.all_caps ? text.toUpperCase() : text;
+  const chars = [...src];
+  const adv = [];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (ch === "\n") { adv.push(0); continue; }
+    const next = chars[i + 1];
+    if (next && next !== "\n") {
+      let step = ctx.measureText(ch + next).width - ctx.measureText(next).width;
+      if (!spaced) step += tracking;
+      adv.push(step);
+    } else adv.push(ctx.measureText(ch).width + tracking);
+  }
+  return adv;
+}
+
+async function outlineSelection() {
+  const d = doc();
+  if (!d?.selection.length) { toast("Create Outlines: select text objects"); return; }
+  const { map, parent } = indexNodes(d.file);
+  const texts = [];
+  const seen = new Set();
+  const walk = (n) => {
+    if (!n || seen.has(n.id)) return;
+    seen.add(n.id);
+    if (n.kind?.type === "text") texts.push(n);
+    for (const c of childrenOf(n) || []) walk(c);
+  };
+  for (const id of d.selection) walk(map.get(id));
+  if (!texts.length) { toast("Create Outlines: select text objects"); return; }
+  const wanted = new Map();
+  for (const n of texts) {
+    for (const run of n.kind.runs || []) {
+      const st = run.style || {};
+      const key = `${st.font_family || "Source Sans 3"}\0${st.font_style || "regular"}`;
+      if (!wanted.has(key)) wanted.set(key, loadFace(st.font_family || "Source Sans 3", st.font_style));
+    }
+  }
+  const faces = new Map();
+  for (const [key, job] of wanted) faces.set(key, await job);
+  pushHistory();
+  const roots = new Set(d.selection);
+  const next = d.selection.filter((id) => !texts.some((t) => t.id === id));
+  for (const n of texts) {
+    const group = await outlineGroup(d.file, n, faces);
+    const list = childrenOf(parent.get(n.id));
+    if (!list) continue;
+    const i = list.findIndex((c) => c.id === n.id);
+    if (i < 0) continue;
+    if (!group) list.splice(i, 1);
+    else {
+      list.splice(i, 1, group);
+      if (roots.has(n.id)) next.push(group.id);
+    }
+  }
+  d.selection = next;
+  paint();
+  refreshChrome();
+}
+
+async function outlineGroup(file, node, faces) {
+  const xf = node.kind.xf || [1, 0, 0, 1, 0, 0];
+  const justify = node.kind.para?.justify || "Left";
+  const children = [];
+  let cursor = 0;
+  for (const run of node.kind.runs || []) {
+    const st = run.style || {};
+    const face = faces.get(`${st.font_family || "Source Sans 3"}\0${st.font_style || "regular"}`);
+    if (!face) continue;
+    const advances = await shapedAdvances(st, run.text || "", face);
+    const { paths, advance } = outlineGlyphs(face, run.text || "", st, xf, cursor ? "Left" : justify, advances, cursor);
+    const fill = st.fill || solid(0, 0, 0);
+    const stroke = st.stroke?.type && st.stroke.type !== "none" ? st.stroke : nonePaint();
+    const width = st.stroke_width || 0;
+    for (const path of paths) children.push(makePathNode(file, path, { fill, stroke, strokeWidth: width }));
+    cursor += advance;
+  }
+  if (!children.length) return null;
+  const g = blankNode(allocId(file), { type: "group", children, clip: false }, {
+    items: [],
+    effects: deepClone(node.appearance?.effects || []),
+  });
+  g.name = node.name || textOf(node).slice(0, 32) || null;
+  g.opacity = node.opacity ?? 1;
+  g.blend = node.blend || "Normal";
+  return g;
 }
 
 /* ---------- commands ---------- */
@@ -1039,7 +1145,7 @@ const commands = {
   warpWave: () => warpSelection("wave", 30),
   offsetPath: () => offsetSelection(),
   simplify: () => simplifySelection(),
-  createOutlines: () => toast("Create Outlines keeps the live type — glyph outlines need the font’s raw contours"),
+  createOutlines: () => { outlineSelection().catch((e) => toast(e.message || "Create Outlines failed")); },
   lockSel: () => commands.lock(),
   sameFill: () => selectSame("fill"),
   sameStroke: () => selectSame("stroke"),
