@@ -16,6 +16,10 @@ import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js"
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
 import { createLayers, layerColorCss } from "./layers-panel.js";
+import {
+  readGrid, gridOverlay, widgetGeom, widgetHit, gridHandles, dragHandle, depthAt, setOffset,
+  moveMap, walkPoints, planeBounds, planeColor, defaultGrid, pagePoint, unproject,
+} from "./perspective.js";
 import { importSVG } from "./svg.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -64,6 +68,9 @@ const TOOL_DEFS = [
     ] },
     { id: "shapeBuilder", label: "Shape Builder Tool", icon: "shapeBuilder", flyout: [
       { id: "blend", label: "Blend Tool", key: "W", icon: "blend" },
+    ] },
+    { id: "perspectiveGrid", label: "Perspective Grid Tool", key: "Shift+P", icon: "perspective", flyout: [
+      { id: "perspectiveSelection", label: "Perspective Selection Tool", key: "Shift+V", icon: "perspectiveSelection" },
     ] },
   ] },
   { cat: "Type", slots: [
@@ -394,7 +401,8 @@ function paintOverlay() {
   const b0 = selectionBounds(d.file, d.selection);
   const nudge = gesture.on && gesture.mode === "move" ? { x: gesture.dx || 0, y: gesture.dy || 0 } : { x: 0, y: 0 };
   const b = b0 ? { x0: b0.x0 + nudge.x, y0: b0.y0 + nudge.y, x1: b0.x1 + nudge.x, y1: b0.y1 + nudge.y } : null;
-  if (b && ui.tool !== "directSelection" && ui.tool !== "groupSelection" && ui.tool !== "artboard") {
+  const perspSel = ui.tool === "perspectiveSelection" && d.selection.some((id) => indexNodes(d.file).map.get(id)?.perspective?.plane);
+  if (b && !perspSel && ui.tool !== "directSelection" && ui.tool !== "groupSelection" && ui.tool !== "artboard") {
     const p0 = docToScreen({ x: b.x0, y: b.y0 }), p1 = docToScreen({ x: b.x1, y: b.y1 });
     const x = Math.min(p0.x, p1.x), y = Math.min(p0.y, p1.y);
     const w = Math.abs(p1.x - p0.x), h = Math.abs(p1.y - p0.y);
@@ -491,7 +499,90 @@ function paintOverlay() {
       parts.push(`<text x="${s.x}" y="${s.y - 6}" fill="#b0b0b0" font-size="11" font-family="Inter, sans-serif">${esc(name)}</text>`);
     });
   }
+  paintPerspective(parts);
   ov.innerHTML = parts.join("");
+}
+
+function paintPerspective(parts) {
+  const raw = readGrid(file());
+  const geo = raw && gridOverlay(raw);
+  if (!geo) return;
+  const tol = 1 / (doc().zoom || 1);
+  for (const pl of geo.planes) {
+    for (const [a, b] of pl.lines) {
+      const s0 = docToScreen(a), s1 = docToScreen(b);
+      parts.push(`<line x1="${s0.x}" y1="${s0.y}" x2="${s1.x}" y2="${s1.y}" stroke="${pl.color}" stroke-opacity="${pl.opacity}" stroke-width="1"/>`);
+    }
+    if (pl.outline) {
+      const pts = pl.outline.map((p) => docToScreen(p)).map((p) => `${p.x},${p.y}`).join(" ");
+      parts.push(`<polygon points="${pts}" fill="none" stroke="${pl.color}" stroke-width="2"/>`);
+    }
+  }
+  const h0 = docToScreen({ x: geo.horizonX0 - 50 * tol, y: geo.horizonY });
+  const h1 = docToScreen({ x: geo.horizonX1 + 50 * tol, y: geo.horizonY });
+  parts.push(`<line x1="${h0.x}" y1="${h0.y}" x2="${h1.x}" y2="${h1.y}" stroke="#606060" stroke-dasharray="4 3" stroke-width="1"/>`);
+  for (const dmd of geo.diamonds) {
+    const s = docToScreen(dmd.p);
+    const r = 5;
+    const pts = [[0, -r], [r, 0], [0, r], [-r, 0]].map(([x, y]) => `${s.x + x},${s.y + y}`).join(" ");
+    parts.push(`<polygon points="${pts}" fill="${planeColor(dmd.plane)}" fill-opacity=".86" stroke="#202020" stroke-width="1"/>`);
+  }
+  if (ui.tool === "perspectiveGrid") {
+    for (const h of gridHandles(raw, tol)) {
+      const s = docToScreen(h.p);
+      const filled = h.id.startsWith("vp") || h.id.startsWith("ground");
+      const size = h.id.startsWith("ground") ? 5 : h.id.startsWith("vp") ? 7 : 6;
+      parts.push(`<rect x="${s.x - size / 2}" y="${s.y - size / 2}" width="${size}" height="${size}" fill="${filled ? "#202020" : "#fff"}" stroke="#202020"/>`);
+    }
+  }
+  paintPerspSelection(parts);
+  const c = $("canvas");
+  const w = widgetGeom(c?.clientWidth || 800, c?.clientHeight || 600);
+  for (const face of w.faces) {
+    const on = face.plane === geo.active;
+    const pts = face.quad.map((p) => `${p.x},${p.y}`).join(" ");
+    parts.push(`<polygon points="${pts}" fill="${planeColor(face.plane)}" fill-opacity="${on ? ".9" : ".27"}" stroke="#404040" stroke-width="1"/>`);
+  }
+  parts.push(`<circle cx="${w.dot.c.x}" cy="${w.dot.c.y}" r="${w.dot.r}" fill="none" stroke="${geo.active === "none" ? "#202020" : "#999"}" stroke-width="1.5"/>`);
+}
+
+function perspHandlePoints(box) {
+  const mx = (box.x0 + box.x1) / 2, my = (box.y0 + box.y1) / 2;
+  return [
+    [box.x0, box.y0], [mx, box.y0], [box.x1, box.y0], [box.x1, my],
+    [box.x1, box.y1], [mx, box.y1], [box.x0, box.y1], [box.x0, my],
+  ];
+}
+
+function paintPerspSelection(parts) {
+  if (ui.tool !== "perspectiveSelection") return;
+  const raw = readGrid(file());
+  if (!raw) return;
+  const { map } = indexNodes(file());
+  for (const id of doc().selection) {
+    const n = map.get(id);
+    const att = n?.perspective;
+    if (!att?.plane) continue;
+    const box = planeBounds(raw, n, att.plane, att.depth || 0);
+    if (!box) continue;
+    const corner = (x, y) => pagePoint(raw, att.plane, att.depth || 0, x, y);
+    const pts = [corner(box.x0, box.y0), corner(box.x1, box.y0), corner(box.x1, box.y1), corner(box.x0, box.y1)].filter(Boolean);
+    if (pts.length < 4) continue;
+    const color = planeColor(att.plane);
+    const spts = pts.map((p) => docToScreen(p));
+    parts.push(`<polygon points="${spts.map((p) => `${p.x},${p.y}`).join(" ")}" fill="none" stroke="${color}" stroke-width="1"/>`);
+    const handles = [
+      [box.x0, box.y0], [(box.x0 + box.x1) / 2, box.y0], [box.x1, box.y0],
+      [box.x1, (box.y0 + box.y1) / 2], [box.x1, box.y1], [(box.x0 + box.x1) / 2, box.y1],
+      [box.x0, box.y1], [box.x0, (box.y0 + box.y1) / 2],
+    ];
+    for (const [x, y] of handles) {
+      const q = corner(x, y);
+      if (!q) continue;
+      const s = docToScreen(q);
+      parts.push(`<rect x="${s.x - 3}" y="${s.y - 3}" width="6" height="6" fill="#fff" stroke="${color}"/>`);
+    }
+  }
 }
 
 function pathOutline(node, color) {
@@ -921,6 +1012,15 @@ const commands = {
   actualSize: () => { const d = doc(); if (!d) return; const c = $("canvas"); zoomAt(c.clientWidth / 2, c.clientHeight / 2, 1 / d.zoom); },
   toggleRulers: () => { ui.rulers = !ui.rulers; $("ruler-row").style.display = ui.rulers ? "" : "none"; $("ruler-v").style.display = ui.rulers ? "" : "none"; paintRulers(); },
   toggleGrid: () => { ui.grid = !ui.grid; paint(); },
+  togglePerspective: () => {
+    const f = file();
+    if (!f) return;
+    f.document.unknown = f.document.unknown || {};
+    const g = f.document.unknown.perspectiveGrid;
+    if (!g) f.document.unknown.perspectiveGrid = defaultGrid(f.document.artboards?.[0]?.rect);
+    else g.visible = g.visible === false;
+    paintOverlay();
+  },
   toggleSnap: () => { ui.snap = !ui.snap; toast(ui.snap ? "Snap on" : "Snap off"); },
   toggleOutline: () => { ui.outline = !ui.outline; paint(); refreshChrome(); },
   toggleControl: () => { ui.control = !ui.control; $("controlbar").hidden = !ui.control; refreshChrome(); },
@@ -1189,8 +1289,17 @@ function warpSelection(style, bend) {
 
 function setTool(id) {
   ui.tool = id;
+  for (const slot of TOOL_DEFS.flatMap((c) => c.slots)) {
+    if (slot.id === id || slot.flyout?.some((t) => t.id === id)) ui.slotChoice[slot.id] = id;
+  }
   ui.pen = null;
   ui.blendPick = null;
+  if ((id === "perspectiveGrid" || id === "perspectiveSelection") && file()) {
+    const f = file();
+    f.document.unknown = f.document.unknown || {};
+    if (!f.document.unknown.perspectiveGrid) f.document.unknown.perspectiveGrid = defaultGrid(f.document.artboards?.[0]?.rect);
+    else if (f.document.unknown.perspectiveGrid.visible === false) f.document.unknown.perspectiveGrid.visible = true;
+  }
   const c = $("canvas");
   c.classList.remove("hand", "cross", "zoom", "text");
   if (id === "hand" || ui.space) c.classList.add("hand");
@@ -1222,6 +1331,86 @@ function onDown(e) {
   gesture.alt = e.altKey;
   gesture.ids = [...d.selection];
   $("canvas").setPointerCapture?.(e.pointerId);
+
+  const grid = readGrid(d.file);
+  if (grid && grid.visible !== false) {
+    const cnv = $("canvas");
+    const picked = widgetHit(screen.x, screen.y, cnv.clientWidth, cnv.clientHeight);
+    if (picked) { grid.plane = picked; gesture.on = false; paintOverlay(); return; }
+  }
+  if (tool === "perspectiveGrid" && grid && !grid.locked) {
+    const tol = 6 / d.zoom;
+    const handles = gridHandles(grid, 1 / d.zoom);
+    const h = handles.filter((q) => Math.hypot(q.p.x - p.x, q.p.y - p.y) <= tol).sort((a, b) => Math.hypot(a.p.x - p.x, a.p.y - p.y) - Math.hypot(b.p.x - p.x, b.p.y - p.y))[0];
+    if (h) {
+      gesture.mode = "perspGrid";
+      gesture.handle = h.id;
+      gesture.grid0 = structuredClone(grid);
+      gesture.steps = h.steps;
+      return;
+    }
+    const diamond = (gridOverlay(grid)?.diamonds || []).find((q) => Math.hypot(q.p.x - p.x, q.p.y - p.y) <= tol);
+    if (diamond) {
+      gesture.mode = "perspPlane";
+      gesture.plane = diamond.plane;
+      gesture.anchor = diamond.p;
+      gesture.grid0 = structuredClone(grid);
+      gesture.offset0 = diamond.plane === "left" ? grid.leftOffset || 0 : diamond.plane === "right" ? grid.rightOffset || 0 : grid.groundOffset || 0;
+      return;
+    }
+    gesture.on = false;
+    return;
+  }
+  if (tool === "perspectiveSelection") {
+    const raw = readGrid(d.file);
+    if (raw && d.selection.length === 1) {
+      const n = indexNodes(d.file).map.get(d.selection[0]);
+      const att = n?.perspective;
+      const box = att?.plane ? planeBounds(raw, n, att.plane, att.depth || 0) : null;
+      if (box) {
+        const hs = perspHandlePoints(box);
+        const tol = 6 / d.zoom;
+        const hi = hs.findIndex(([x, y]) => {
+          const q = pagePoint(raw, att.plane, att.depth || 0, x, y);
+          return q && Math.hypot(q.x - p.x, q.y - p.y) <= tol;
+        });
+        if (hi >= 0) {
+          gesture.mode = "perspScale";
+          gesture.nodeId = n.id;
+          gesture.plane = att.plane;
+          gesture.depth = att.depth || 0;
+          gesture.box = box;
+          gesture.handle = hi;
+          gesture.node0 = deepClone(n);
+          return;
+        }
+      }
+    }
+    const hit = hitAt(p, false);
+    if (hit) {
+      const root = hit;
+      if (e.shiftKey) d.selection = d.selection.includes(root.id) ? d.selection.filter((id) => id !== root.id) : [...d.selection, root.id];
+      else if (!d.selection.includes(root.id)) d.selection = [root.id];
+      if (root.perspective?.plane) {
+        gesture.mode = "perspMove";
+        gesture.plane = root.perspective.plane;
+        gesture.nodeId = root.id;
+        gesture.copy = e.altKey;
+      } else {
+        gesture.mode = "move";
+        gesture.ids = collectTop(d.file, d.selection);
+      }
+      refreshChrome();
+      paintOverlay();
+      return;
+    }
+    d.selection = [];
+    gesture.mode = "marquee";
+    gesture.marquee = { a: screen, b: screen };
+    refreshChrome();
+    paintOverlay();
+    return;
+  }
 
   if (tool === "hand") { gesture.mode = "pan"; $("canvas").classList.add("panning"); return; }
   if (tool === "zoom") {
@@ -1375,6 +1564,71 @@ function onMove(e) {
     paintOverlay();
     return;
   }
+  if (gesture.mode === "perspGrid") {
+    const raw = readGrid(d.file);
+    if (raw && !gesture.gridHist) { pushHistory(); gesture.gridHist = true; }
+    const next = dragHandle(gesture.grid0, gesture.handle, p, { shift: e.shiftKey, alt: e.altKey, from: gesture.start }, gesture.steps);
+    if (raw) Object.assign(raw, next || gesture.grid0);
+    paintOverlay();
+    return;
+  }
+  if (gesture.mode === "perspPlane") {
+    const raw = readGrid(d.file);
+    if (raw && !gesture.gridHist) { pushHistory(); gesture.gridHist = true; }
+    const moved = { x: gesture.anchor.x + (p.x - gesture.start.x), y: gesture.anchor.y + (p.y - gesture.start.y) };
+    const depth = depthAt(gesture.grid0, gesture.plane, gesture.offset0 || 0, gesture.anchor, moved);
+    if (raw && depth != null) setOffset(raw, gesture.plane, depth);
+    paintOverlay();
+    return;
+  }
+  if (gesture.mode === "perspScale") {
+    const raw = readGrid(d.file);
+    const live = indexNodes(d.file).map.get(gesture.nodeId);
+    if (raw && live && gesture.node0) {
+      if (!gesture.gridHist) { pushHistory(); gesture.gridHist = true; }
+      live.kind = deepClone(gesture.node0.kind);
+      const hs = perspHandlePoints(gesture.box);
+      const src = hs[gesture.handle];
+      const opp = hs[(gesture.handle + 4) % 8];
+      const q = unproject(raw, gesture.plane, p) || { x: src[0], y: src[1] };
+      let sx = Math.abs(src[0] - opp[0]) < 1e-6 ? 1 : (q.x - opp[0]) / (src[0] - opp[0]);
+      let sy = Math.abs(src[1] - opp[1]) < 1e-6 ? 1 : (q.y - opp[1]) / (src[1] - opp[1]);
+      if (gesture.handle % 2 === 1) {
+        if (gesture.handle % 4 === 1) sx = 1;
+        else sy = 1;
+      } else if (e.shiftKey) {
+        const s = Math.max(Math.abs(sx), Math.abs(sy)) || 1;
+        sx = (sx < 0 ? -s : s);
+        sy = (sy < 0 ? -s : s);
+      }
+      walkPoints(live, (pt) => {
+        const u = unproject(raw, gesture.plane, pt);
+        if (!u) return pt;
+        return pagePoint(raw, gesture.plane, gesture.depth, opp[0] + (u.x - opp[0]) * sx, opp[1] + (u.y - opp[1]) * sy) || pt;
+      });
+    }
+    paint();
+    return;
+  }
+  if (gesture.mode === "perspMove") {
+    const raw = readGrid(d.file);
+    if (!raw) return;
+    if (!gesture.gridHist) {
+      pushHistory();
+      gesture.gridHist = true;
+      if (gesture.copy) {
+        const ids = duplicateNodes(d.file, [gesture.nodeId]);
+        if (ids[0] != null) { gesture.nodeId = ids[0]; d.selection = [ids[0]]; }
+        gesture.copy = false;
+      }
+    }
+    const node = indexNodes(d.file).map.get(gesture.nodeId);
+    const mapPt = moveMap(raw, gesture.plane, gesture.last, p);
+    if (node && mapPt) walkPoints(node, mapPt);
+    gesture.last = p;
+    paint();
+    return;
+  }
   if (gesture.mode === "artboard") {
     const dx = p.x - gesture.last.x, dy = p.y - gesture.last.y;
     if (!dx && !dy) return;
@@ -1449,6 +1703,14 @@ function onUp(e) {
   ui.guides = null;
   if (!d) return;
   if (mode === "artboard") { gesture.abHist = false; gesture.abNodes = null; refreshChrome(); paintOverlay(); return; }
+  if (mode === "perspGrid" || mode === "perspPlane" || mode === "perspMove" || mode === "perspScale") {
+    gesture.gridHist = false;
+    gesture.grid0 = null;
+    gesture.node0 = null;
+    refreshChrome();
+    paint();
+    return;
+  }
   if (mode === "marquee") {
     const a = screenToDoc(gesture.marquee.a.x, gesture.marquee.a.y);
     const b = screenToDoc(gesture.marquee.b.x, gesture.marquee.b.y);
@@ -2227,6 +2489,7 @@ function menuItems(name) {
       { sep: true },
       { label: (ui.rulers ? "✓ " : "") + "Rulers", cmd: "toggleRulers", sc: "Ctrl+R" },
       { label: (ui.grid ? "✓ " : "") + "Grid", cmd: "toggleGrid", sc: "Ctrl+'" },
+      { label: ((readGrid(file()) && readGrid(file()).visible !== false) ? "✓ " : "") + "Perspective Grid", cmd: "togglePerspective" },
       { label: (ui.snap ? "✓ " : "") + "Snap", cmd: "toggleSnap" },
       { label: (ui.control ? "✓ " : "") + "Control Bar", cmd: "toggleControl" },
     ],
@@ -3166,6 +3429,8 @@ const HINTS = {
   gradient: [["Drag", 1], [" across a selected object to set the gradient direction", 0]],
   rotate: [["Drag", 1], [" to transform  |  ", 0], ["Alt+Click", 1], [" to set the reference point", 0]],
   artboard: [["Click", 1], [" an artboard to edit it  |  ", 0], ["Drag", 1], [" to move it", 0]],
+  perspectiveSelection: [["Drag", 1], [" to move in perspective  |  ", 0], ["Alt+Drag", 1], [" to copy  |  ", 0], ["Drag a handle", 1], [" to scale in perspective", 0]],
+  perspectiveGrid: [["Drag", 1], [" a handle to reshape the grid  |  ", 0], ["1–4", 1], [" pick a plane", 0]],
 };
 function drawHint() {
   const segs = HINTS[ui.tool] || HINTS[ui.tool === "ellipse" || ui.tool === "polygon" || ui.tool === "star" || ui.tool === "roundedRectangle" ? "rectangle" : ""] || [["Search", 1], [" commands and tools for this tool", 0]];
@@ -3409,6 +3674,17 @@ function onKey(e) {
     paint();
     return;
   }
+  if (!typing && !e.metaKey && !e.ctrlKey && !e.altKey && ["1", "2", "3", "4"].includes(e.key)) {
+    const g = readGrid(file());
+    if (g && g.visible !== false) {
+      g.plane = { 1: "left", 2: "ground", 3: "right", 4: "none" }[e.key];
+      paintOverlay();
+      e.preventDefault();
+      return;
+    }
+  }
+  if (!typing && e.shiftKey && !e.metaKey && !e.ctrlKey && e.key.toLowerCase() === "v") { e.preventDefault(); setTool("perspectiveSelection"); return; }
+  if (!typing && e.shiftKey && !e.metaKey && !e.ctrlKey && e.key.toLowerCase() === "p") { e.preventDefault(); setTool("perspectiveGrid"); return; }
   if (!typing && e.shiftKey && !e.metaKey && !e.ctrlKey && e.key.toLowerCase() === "d") { e.preventDefault(); cycleDrawMode(); return; }
   if (!typing && e.shiftKey && !e.metaKey && !e.ctrlKey && e.key.toLowerCase() === "x") { e.preventDefault(); swapPaint(); return; }
   if (!typing && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); toggleScreen(); return; }

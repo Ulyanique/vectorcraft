@@ -39,6 +39,8 @@ const FILE = {
   gradient: "dc-gradient",
   eyedropper: "pipette",
   mesh: "dc-mesh",
+  perspective: "dc-perspective",
+  perspectiveSelection: "dc-perspective",
   home: "house",
   search: "search",
   chevron: "chevron-down",
