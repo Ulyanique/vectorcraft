@@ -15,7 +15,7 @@ import { loadFontMetrics } from "./fontmetrics.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
-import { createLayers } from "./layers-panel.js";
+import { createLayers, layerColorCss } from "./layers-panel.js";
 import { importSVG } from "./svg.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -150,6 +150,14 @@ const ui = {
   screen: false,
   refPoint: 4,
   appearPin: null,
+  snapPoint: true,
+  snapGrid: false,
+  showGuides: true,
+  smartGuides: true,
+  transGrid: false,
+  scaleStrokes: false,
+  moveArt: false,
+  keyInc: 1,
 };
 
 const gesture = { on: false };
@@ -344,7 +352,7 @@ function paint() {
     return `<g data-artboard="${a.id}">
       <rect x="${r.x0 + s2}" y="${r.y0 + s2}" width="${w}" height="${h}" fill="rgba(0,0,0,0.102)"/>
       <rect x="${r.x0 + s1}" y="${r.y0 + s1}" width="${w}" height="${h}" fill="rgba(0,0,0,0.204)"/>
-      <rect x="${r.x0}" y="${r.y0}" width="${w}" height="${h}" fill="#fff"${edge}/>
+      <rect x="${r.x0}" y="${r.y0}" width="${w}" height="${h}" fill="${ui.transGrid ? "url(#tgrid)" : "#fff"}"${edge}/>
     </g>`;
   }).join("");
   let grid = "";
@@ -356,8 +364,9 @@ function paint() {
     for (let y = Math.floor(bounds.y0 / step) * step; y <= bounds.y1; y += step) lines.push(`<line x1="${bounds.x0}" y1="${y}" x2="${bounds.x1}" y2="${y}" stroke="#000" stroke-opacity=".12" stroke-width="${1 / d.zoom}"/>`);
     grid = lines.join("");
   }
+  const checker = ui.transGrid ? `<pattern id="tgrid" width="${16}" height="${16}" patternUnits="userSpaceOnUse"><rect width="16" height="16" fill="#fff"/><rect width="8" height="8" fill="#d9d9d9"/><rect x="8" y="8" width="8" height="8" fill="#d9d9d9"/></pattern>` : "";
   art.innerHTML = `<defs>
-    ${rendered.defs}
+    ${checker}${rendered.defs}
   </defs>
   <g id="view" transform="${viewTransform()}">${boards}${grid}${rendered.body}<g id="live-preview"></g></g>`;
   paintOverlay();
@@ -369,10 +378,23 @@ function paintOverlay() {
   const d = doc();
   if (!d) { ov.innerHTML = ""; return; }
   const parts = [];
+  if (d.selection.length && ui.tool !== "artboard") {
+    const { map, parent } = indexNodes(d.file);
+    const outlines = [];
+    for (const id of d.selection) {
+      const n = map.get(id);
+      if (!n) continue;
+      let layer = n;
+      while (layer && layer.kind?.type !== "layer") layer = parent.get(layer.id);
+      outlines.push(pathOutline(n, layer ? layerColorCss(layer) : "#4f80ff"));
+    }
+    const body = outlines.filter(Boolean).join("");
+    if (body) parts.push(`<g transform="${viewTransform()}">${body}</g>`);
+  }
   const b0 = selectionBounds(d.file, d.selection);
   const nudge = gesture.on && gesture.mode === "move" ? { x: gesture.dx || 0, y: gesture.dy || 0 } : { x: 0, y: 0 };
   const b = b0 ? { x0: b0.x0 + nudge.x, y0: b0.y0 + nudge.y, x1: b0.x1 + nudge.x, y1: b0.y1 + nudge.y } : null;
-  if (b && ui.tool !== "directSelection" && ui.tool !== "groupSelection") {
+  if (b && ui.tool !== "directSelection" && ui.tool !== "groupSelection" && ui.tool !== "artboard") {
     const p0 = docToScreen({ x: b.x0, y: b.y0 }), p1 = docToScreen({ x: b.x1, y: b.y1 });
     const x = Math.min(p0.x, p1.x), y = Math.min(p0.y, p1.y);
     const w = Math.abs(p1.x - p0.x), h = Math.abs(p1.y - p0.y);
@@ -388,22 +410,25 @@ function paintOverlay() {
     parts.push(`<circle cx="${rot.x}" cy="${rot.y}" r="4" fill="#fff" stroke="#4f80ff"/>`);
   }
   if ((ui.tool === "directSelection" || ui.tool === "anchorPoint" || ui.tool === "deleteAnchor") && d.selection.length) {
-    const { map } = indexNodes(d.file);
+    const { map, parent } = indexNodes(d.file);
     for (const id of d.selection) {
       const n = map.get(id);
       if (n?.kind?.type !== "path") continue;
+      let layer = n;
+      while (layer && layer.kind?.type !== "layer") layer = parent.get(layer.id);
+      const color = layer ? layerColorCss(layer) : "#4f80ff";
       for (const sp of n.kind.path.subpaths || []) {
         for (const a of sp.anchors) {
           const s = docToScreen(a.p);
           if (!samePt(a.in, a.p)) {
             const hin = docToScreen(a.in);
-            parts.push(`<line x1="${s.x}" y1="${s.y}" x2="${hin.x}" y2="${hin.y}" stroke="#8ab4ff"/><circle cx="${hin.x}" cy="${hin.y}" r="3" fill="#fff" stroke="#4f80ff"/>`);
+            parts.push(`<line x1="${s.x}" y1="${s.y}" x2="${hin.x}" y2="${hin.y}" stroke="${color}" stroke-width="1"/><circle cx="${hin.x}" cy="${hin.y}" r="3" fill="#fff" stroke="${color}"/>`);
           }
           if (!samePt(a.out, a.p)) {
             const hout = docToScreen(a.out);
-            parts.push(`<line x1="${s.x}" y1="${s.y}" x2="${hout.x}" y2="${hout.y}" stroke="#8ab4ff"/><circle cx="${hout.x}" cy="${hout.y}" r="3" fill="#fff" stroke="#4f80ff"/>`);
+            parts.push(`<line x1="${s.x}" y1="${s.y}" x2="${hout.x}" y2="${hout.y}" stroke="${color}" stroke-width="1"/><circle cx="${hout.x}" cy="${hout.y}" r="3" fill="#fff" stroke="${color}"/>`);
           }
-          parts.push(`<rect x="${s.x - 3.5}" y="${s.y - 3.5}" width="7" height="7" fill="${a.kind === "Smooth" ? "#4f80ff" : "#fff"}" stroke="#4f80ff"/>`);
+          parts.push(`<rect x="${s.x - 2.5}" y="${s.y - 2.5}" width="5" height="5" fill="${color}" stroke="${color}"/>`);
         }
       }
     }
@@ -413,6 +438,24 @@ function paintOverlay() {
     if (gesture.cursor) pts.push(docToScreen(gesture.cursor));
     if (pts.length > 1) parts.push(`<polyline points="${pts.map((p) => `${p.x},${p.y}`).join(" ")}" fill="none" stroke="#4f80ff" stroke-width="1.2"/>`);
     for (const p of pts.slice(0, ui.pen.anchors.length)) parts.push(`<rect x="${p.x - 3}" y="${p.y - 3}" width="6" height="6" fill="#fff" stroke="#4f80ff"/>`);
+  }
+  if (ui.showGuides !== false) {
+    const boards = d.file.document.artboards || [];
+    for (const g of d.file.document.guides || []) {
+      const board = g.artboard != null ? boards.find((a) => a.id === g.artboard) : null;
+      const r = board?.rect;
+      if (g.vertical) {
+        const x = docToScreen({ x: g.pos, y: 0 }).x;
+        const y0 = r ? docToScreen({ x: 0, y: r.y0 }).y : 0;
+        const y1 = r ? docToScreen({ x: 0, y: r.y1 }).y : 4000;
+        parts.push(`<line x1="${x}" y1="${y0}" x2="${x}" y2="${y1}" stroke="#3ec7ff" stroke-width="1"/>`);
+      } else {
+        const y = docToScreen({ x: 0, y: g.pos }).y;
+        const x0 = r ? docToScreen({ x: r.x0, y: 0 }).x : 0;
+        const x1 = r ? docToScreen({ x: r.x1, y: 0 }).x : 4000;
+        parts.push(`<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="#3ec7ff" stroke-width="1"/>`);
+      }
+    }
   }
   if (ui.guides) {
     if (ui.guides.x != null) {
@@ -433,6 +476,12 @@ function paintOverlay() {
     parts.push(`<polyline points="${gesture.lasso.map((p) => `${p.x},${p.y}`).join(" ")}" fill="rgba(79,128,255,.1)" stroke="#4f80ff"/>`);
   }
   const boards = d.file.document.artboards || [];
+  if (ui.tool === "artboard" && boards[d.artboard]) {
+    const r = boards[d.artboard].rect;
+    const p0 = docToScreen({ x: r.x0, y: r.y0 }), p1 = docToScreen({ x: r.x1, y: r.y1 });
+    const x = Math.min(p0.x, p1.x), y = Math.min(p0.y, p1.y);
+    parts.push(`<rect x="${x}" y="${y}" width="${Math.abs(p1.x - p0.x)}" height="${Math.abs(p1.y - p0.y)}" fill="none" stroke="#4f80ff" stroke-dasharray="4 3"/>`);
+  }
   // A single artboard is unlabeled unless the Artboard tool is up; several are numbered.
   if (boards.length > 1 || ui.tool === "artboard") {
     boards.forEach((a, i) => {
@@ -443,6 +492,22 @@ function paintOverlay() {
     });
   }
   ov.innerHTML = parts.join("");
+}
+
+function pathOutline(node, color) {
+  const parts = [];
+  const walk = (n) => {
+    const k = n?.kind;
+    if (!k || n.visible === false) return;
+    if (k.type === "path" && k.path && !k.guide) {
+      const d = pathD(k.path);
+      if (d) parts.push(`<path d="${d}" fill="none" stroke="${color}" stroke-width="1" vector-effect="non-scaling-stroke"/>`);
+    } else if (k.type !== "text") {
+      for (const c of childrenOf(n) || []) walk(c);
+    }
+  };
+  walk(node);
+  return parts.join("");
 }
 
 function samePt(a, b) { return Math.abs(a.x - b.x) < 1e-3 && Math.abs(a.y - b.y) < 1e-3; }
@@ -564,30 +629,32 @@ function snapPoint(p, extra = []) {
   if (!ui.snap || !file()) return p;
   const tol = 6 / doc().zoom;
   const xs = [], ys = [];
-  for (const a of file().document.artboards) {
-    xs.push(a.rect.x0, a.rect.x1, (a.rect.x0 + a.rect.x1) / 2);
-    ys.push(a.rect.y0, a.rect.y1, (a.rect.y0 + a.rect.y1) / 2);
+  if (ui.snapPoint !== false) {
+    for (const a of file().document.artboards) {
+      xs.push(a.rect.x0, a.rect.x1, (a.rect.x0 + a.rect.x1) / 2);
+      ys.push(a.rect.y0, a.rect.y1, (a.rect.y0 + a.rect.y1) / 2);
+    }
+    const { map } = indexNodes(file());
+    for (const n of map.values()) {
+      if (n.kind?.type === "layer" || doc().selection.includes(n.id)) continue;
+      const b = nodeBounds(n);
+      if (!b) continue;
+      xs.push(b.x0, b.x1, (b.x0 + b.x1) / 2);
+      ys.push(b.y0, b.y1, (b.y0 + b.y1) / 2);
+    }
+    xs.push(...extra.map((q) => q.x));
+    ys.push(...extra.map((q) => q.y));
   }
-  const { map } = indexNodes(file());
-  for (const n of map.values()) {
-    if (n.kind?.type === "layer" || doc().selection.includes(n.id)) continue;
-    const b = nodeBounds(n);
-    if (!b) continue;
-    xs.push(b.x0, b.x1, (b.x0 + b.x1) / 2);
-    ys.push(b.y0, b.y1, (b.y0 + b.y1) / 2);
-  }
-  xs.push(...extra.map((q) => q.x));
-  ys.push(...extra.map((q) => q.y));
   let x = p.x, y = p.y, gx = null, gy = null;
   for (const v of xs) if (Math.abs(p.x - v) <= tol) { x = v; gx = v; break; }
   for (const v of ys) if (Math.abs(p.y - v) <= tol) { y = v; gy = v; break; }
-  if (ui.grid) {
-    const g = 32;
+  if (ui.snapGrid) {
+    const g = file().document.grid?.spacing || 72;
     const sx = Math.round(x / g) * g, sy = Math.round(y / g) * g;
-    if (Math.abs(x - sx) < tol) { x = sx; gx = sx; }
-    if (Math.abs(y - sy) < tol) { y = sy; gy = sy; }
+    if (Math.abs(p.x - sx) <= tol) { x = sx; gx = sx; }
+    if (Math.abs(p.y - sy) <= tol) { y = sy; gy = sy; }
   }
-  if (gx != null || gy != null) ui.guides = { x: gx, y: gy };
+  if ((gx != null || gy != null) && ui.smartGuides !== false) ui.guides = { x: gx, y: gy };
   return { x, y };
 }
 
@@ -878,6 +945,12 @@ const commands = {
   sameStroke: () => selectSame("stroke"),
   inverse: () => invertSelection(),
   documentSetup: () => openModal("setup"),
+  preferences: () => openModal("prefs"),
+  editArtboards: () => { ui.tool = "artboard"; refreshChrome(); paintOverlay(); },
+  exitArtboards: () => { ui.tool = "selection"; refreshChrome(); paintOverlay(); },
+  newArtboard: () => addArtboard(),
+  deleteArtboard: () => deleteArtboard(),
+  rearrangeArtboards: () => rearrangeArtboards(),
 };
 
 function paste(dx, dy) {
@@ -1157,6 +1230,18 @@ function onDown(e) {
     return;
   }
   if (tool === "rotateView") { gesture.mode = "viewrot"; gesture.base = d.viewRot || 0; return; }
+  if (tool === "artboard") {
+    const boards = d.file.document.artboards || [];
+    let hit = -1;
+    for (let i = boards.length - 1; i >= 0; i--) {
+      const r = boards[i].rect;
+      if (p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1) { hit = i; break; }
+    }
+    if (hit >= 0) { d.artboard = hit; gesture.mode = "artboard"; }
+    refreshChrome();
+    paintOverlay();
+    return;
+  }
 
   if (tool === "selection") {
     const h = handleAt(screen.x, screen.y);
@@ -1290,6 +1375,21 @@ function onMove(e) {
     paintOverlay();
     return;
   }
+  if (gesture.mode === "artboard") {
+    const dx = p.x - gesture.last.x, dy = p.y - gesture.last.y;
+    if (!dx && !dy) return;
+    if (!gesture.abHist) {
+      pushHistory();
+      gesture.abHist = true;
+      gesture.abNodes = ui.moveArt ? artOnBoard(d.file, d.file.document.artboards[d.artboard].rect) : [];
+    }
+    const ab = d.file.document.artboards[d.artboard];
+    ab.rect.x0 += dx; ab.rect.x1 += dx; ab.rect.y0 += dy; ab.rect.y1 += dy;
+    for (const n of gesture.abNodes || []) translateNode(n, dx, dy);
+    gesture.last = p;
+    paint();
+    return;
+  }
   if (gesture.mode === "marquee" || gesture.mode === "zoomrect") {
     gesture.marquee.b = screen;
     paintOverlay();
@@ -1348,6 +1448,7 @@ function onUp(e) {
   $("canvas").classList.remove("panning");
   ui.guides = null;
   if (!d) return;
+  if (mode === "artboard") { gesture.abHist = false; gesture.abNodes = null; refreshChrome(); paintOverlay(); return; }
   if (mode === "marquee") {
     const a = screenToDoc(gesture.marquee.a.x, gesture.marquee.a.y);
     const b = screenToDoc(gesture.marquee.b.x, gesture.marquee.b.y);
@@ -2535,11 +2636,187 @@ function appearancePanelHTML(n) {
   </div>`;
 }
 
+const UNIT_TABLE = {
+  Points: ["pt", 1], Pixels: ["px", 1], Picas: ["p", 12], Inches: ["in", 72],
+  Millimeters: ["mm", 72 / 25.4], Centimeters: ["cm", 72 / 2.54],
+  Meters: ["m", 72 / 0.0254], Yards: ["yd", 72 * 36], Feet: ["ft", 72 * 12],
+  "Feet & Inches": ["ft", 72 * 12],
+};
+const UNIT_LABELS = Object.keys(UNIT_TABLE);
+function unitName(raw) {
+  if (!raw) return "Points";
+  if (raw === "FeetInches") return "Feet & Inches";
+  return UNIT_TABLE[raw] ? raw : "Points";
+}
+function unitSpec() {
+  const name = unitName(file()?.document.units);
+  const [suffix, per] = UNIT_TABLE[name];
+  return { name, suffix, per };
+}
+function artOnBoard(file, rect) {
+  const nodes = [];
+  for (const layer of file.document.layers || []) {
+    for (const c of childrenOf(layer) || []) {
+      const b = nodeBounds(c);
+      if (!b) continue;
+      const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+      if (cx >= rect.x0 && cx <= rect.x1 && cy >= rect.y0 && cy <= rect.y1) nodes.push(c);
+    }
+  }
+  return nodes;
+}
+function addArtboard() {
+  const d = doc();
+  if (!d) return;
+  pushHistory();
+  const boards = d.file.document.artboards;
+  const last = boards[boards.length - 1];
+  const w = last.rect.x1 - last.rect.x0, h = last.rect.y1 - last.rect.y0;
+  const id = Math.max(0, ...boards.map((a) => a.id || 0)) + 1;
+  boards.push({
+    id, name: "Artboard " + (boards.length + 1),
+    rect: { x0: last.rect.x1 + 60, y0: last.rect.y0, x1: last.rect.x1 + 60 + w, y1: last.rect.y0 + h },
+    show_center_mark: false, show_cross_hairs: false,
+  });
+  d.artboard = boards.length - 1;
+  paint(); refreshChrome();
+}
+function deleteArtboard() {
+  const d = doc();
+  if (!d || d.file.document.artboards.length < 2) { toast("A document needs at least one artboard"); return; }
+  pushHistory();
+  d.file.document.artboards.splice(d.artboard, 1);
+  d.artboard = Math.min(d.artboard, d.file.document.artboards.length - 1);
+  paint(); refreshChrome();
+}
+function rearrangeArtboards() {
+  const d = doc();
+  const boards = d?.file.document.artboards || [];
+  if (boards.length < 2) return;
+  pushHistory();
+  const gap = 60;
+  const cols = Math.ceil(Math.sqrt(boards.length));
+  const plans = [];
+  let x = 0, y = 0, rowH = 0, col = 0;
+  for (const a of boards) {
+    const w = a.rect.x1 - a.rect.x0, h = a.rect.y1 - a.rect.y0;
+    plans.push({ a, dx: x - a.rect.x0, dy: y - a.rect.y0, old: { ...a.rect } });
+    rowH = Math.max(rowH, h);
+    col++;
+    if (col >= cols) { col = 0; x = 0; y += rowH + gap; rowH = 0; }
+    else x += w + gap;
+  }
+  for (const p of plans) {
+    if (ui.moveArt) for (const n of artOnBoard(d.file, p.old)) translateNode(n, p.dx, p.dy);
+    p.a.rect = { x0: p.old.x0 + p.dx, y0: p.old.y0 + p.dy, x1: p.old.x1 + p.dx, y1: p.old.y1 + p.dy };
+  }
+  paint(); refreshChrome();
+}
+function commitArtboard(field, value) {
+  const d = doc();
+  const ab = d?.file.document.artboards?.[d.artboard];
+  if (!ab) return;
+  pushHistory();
+  if (field === "name") { ab.name = value; paintOverlay(); drawPanel(); return; }
+  const v = (+value || 0) * unitSpec().per;
+  const r = ab.rect;
+  if (field === "x") { const w = r.x1 - r.x0; r.x0 = v; r.x1 = v + w; }
+  if (field === "y") { const h = r.y1 - r.y0; r.y0 = v; r.y1 = v + h; }
+  if (field === "w") r.x1 = r.x0 + Math.max(1, v);
+  if (field === "h") r.y1 = r.y0 + Math.max(1, v);
+  paint(); paintOverlay();
+}
+function documentHTML() {
+  const f = file();
+  const u = unitSpec();
+  const nArt = f?.document.artboards?.length || 0;
+  const viewBtn = (id, on, title, ic) => `<button class="ibtn ${on ? "on" : ""}" data-view="${id}" title="${title}">${icon(ic, 15)}</button>`;
+  return `<div class="kind-label">Document</div>
+    <div class="docprops">
+      <div class="psec">
+        <h3>Document</h3>
+        <div class="metric-row"><label>Units</label>
+          <select data-units>${UNIT_LABELS.map((l) => `<option ${l === u.name ? "selected" : ""}>${l}</option>`).join("")}</select>
+        </div>
+        <div class="qa">
+          <button class="btn" data-cmd="documentSetup">Document Setup</button>
+          <button class="btn" data-cmd="editArtboards">Edit Artboards</button>
+          ${nArt > 1 ? `<button class="btn wide" data-cmd="rearrangeArtboards">Rearrange All</button>` : ""}
+        </div>
+      </div>
+      <div class="psec">
+        <h3>Rulers &amp; Grids</h3>
+        <div class="iconrow">
+          ${viewBtn("rulers", ui.rulers, "Show Rulers (Ctrl+R)", "ruler")}
+          ${viewBtn("grid", ui.grid, "Show Grid", "grid-3x3")}
+          ${viewBtn("trans", ui.transGrid, "Show Transparency Grid", "square-dashed")}
+        </div>
+      </div>
+      <div class="psec">
+        <h3>Guides</h3>
+        <div class="iconrow">
+          ${viewBtn("guides", ui.showGuides !== false, "Show Guides", "layout-grid")}
+          ${viewBtn("smart", ui.smartGuides !== false, "Smart Guides", "sparkles")}
+        </div>
+      </div>
+      <div class="psec">
+        <h3>Snap Options</h3>
+        <button class="check ${ui.snapPoint !== false ? "on" : ""}" data-snap="point"><span class="mark">${ui.snapPoint !== false ? "✓" : ""}</span>Snap to Point</button>
+        <button class="check ${ui.snapGrid ? "on" : ""}" data-snap="grid"><span class="mark">${ui.snapGrid ? "✓" : ""}</span>Snap to Grid</button>
+      </div>
+      <div class="psec">
+        <h3>Preferences</h3>
+        <div class="metric-row"><label>Keyboard Increment</label>${numField("", ui.keyInc ?? 1, "keyInc", u.suffix)}</div>
+        <button class="check ${ui.scaleStrokes ? "on" : ""}" data-pref="scale"><span class="mark">${ui.scaleStrokes ? "✓" : ""}</span>Scale Strokes &amp; Effects</button>
+      </div>
+      <div class="psec">
+        <h3>Quick Actions</h3>
+        <div class="qa">
+          <button class="btn" data-cmd="documentSetup">Document Setup</button>
+          <button class="btn" data-cmd="preferences">Preferences</button>
+        </div>
+      </div>
+    </div>`;
+}
+function artboardHTML() {
+  const d = doc();
+  const boards = d?.file.document.artboards || [];
+  const i = Math.min(d?.artboard || 0, Math.max(0, boards.length - 1));
+  const ab = boards[i];
+  if (!ab) return documentHTML();
+  const u = unitSpec();
+  const r = ab.rect;
+  const disp = (v) => v / u.per;
+  return `<div class="kind-label">Artboard</div>
+    <div class="docprops">
+      <div class="psec">
+        <input class="full" data-ab="name" value="${esc(ab.name || "Artboard")}"/>
+        <div class="grid2" style="margin-top:6px">
+          ${numField("X:", disp(r.x0), "abx", u.suffix)}${numField("W:", disp(r.x1 - r.x0), "abw", u.suffix)}
+          ${numField("Y:", disp(r.y0), "aby", u.suffix)}${numField("H:", disp(r.y1 - r.y0), "abh", u.suffix)}
+        </div>
+        <button class="check ${ui.moveArt ? "on" : ""}" data-moveart><span class="mark">${ui.moveArt ? "✓" : ""}</span>Move Artwork with Artboard</button>
+        <div class="qa">
+          <button class="btn" data-cmd="newArtboard">New Artboard</button>
+          <button class="btn" data-cmd="deleteArtboard" ${boards.length < 2 ? "disabled" : ""}>Delete Artboard</button>
+        </div>
+      </div>
+      <div class="psec">
+        <h3>Quick Actions</h3>
+        <div class="qa">
+          <button class="btn" data-cmd="rearrangeArtboards" ${boards.length < 2 ? "disabled" : ""}>Rearrange All</button>
+          <button class="btn" data-cmd="exitArtboards">Exit</button>
+        </div>
+      </div>
+    </div>`;
+}
 function propertiesHTML(n, nodes) {
-  if (!n) return `<div class="psec"><h3>Document</h3><p class="hint">Nothing selected. Click an object, or draw with the shape tools.</p>
-    <div class="qa"><button class="btn" data-cmd="documentSetup">Document Setup</button><button class="btn" data-cmd="fitArtboard">Fit Artboard</button></div></div>`;
+  if (ui.tool === "artboard") return artboardHTML();
+  if (!n) return documentHTML();
   const b = selectionBounds(file(), doc().selection) || { x0: 0, y0: 0, x1: 0, y1: 0 };
   const rp = refPointOf(b, ui.refPoint ?? 4);
+  const u = unitSpec();
+  const disp = (v) => v / u.per;
   const fill = shownFill(n);
   const stroke = shownStroke(n);
   const text = n.kind?.type === "text" ? n.kind.runs?.[0]?.style : null;
@@ -2553,8 +2830,8 @@ function propertiesHTML(n, nodes) {
     <div class="xf-row">
       ${refPointHTML()}
       <div class="grid2 grow">
-        ${numField("X:", rp.x, "x", "pt")}${numField("W:", b.x1 - b.x0, "w", "pt")}
-        ${numField("Y:", rp.y, "y", "pt")}${numField("H:", b.y1 - b.y0, "h", "pt")}
+        ${numField("X:", disp(rp.x), "x", u.suffix)}${numField("W:", disp(b.x1 - b.x0), "w", u.suffix)}
+        ${numField("Y:", disp(rp.y), "y", u.suffix)}${numField("H:", disp(b.y1 - b.y0), "h", u.suffix)}
       </div>
     </div>
     <div class="row xf-rot">
@@ -2688,6 +2965,7 @@ function layersHTML() {
 function wirePanel() {
   const body = $("pbody");
   body.querySelectorAll("[data-cmd]").forEach((b) => b.onclick = () => {
+    if (b.disabled) return;
     const cmd = b.dataset.cmd;
     if (cmd === "nonePaint") applyPaint(ui.paintTarget, nonePaint());
     else if (cmd === "black") applyPaint(ui.paintTarget, solid(0, 0, 0));
@@ -2756,6 +3034,31 @@ function wirePanel() {
     if (input.dataset.field === "text") input.oninput = () => commitField("text", input.value, true);
     input.onkeydown = (e) => e.stopPropagation();
   });
+  body.querySelectorAll("[data-units]").forEach((sel) => sel.onchange = () => {
+    const d = doc();
+    if (!d) return;
+    pushHistory();
+    d.file.document.units = sel.value === "Feet & Inches" ? "FeetInches" : sel.value;
+    drawPanel();
+  });
+  body.querySelectorAll("[data-view]").forEach((b) => b.onclick = () => {
+    const k = b.dataset.view;
+    if (k === "rulers") commands.toggleRulers();
+    else if (k === "grid") commands.toggleGrid();
+    else if (k === "trans") { ui.transGrid = !ui.transGrid; paint(); }
+    else if (k === "guides") ui.showGuides = ui.showGuides === false;
+    else if (k === "smart") ui.smartGuides = ui.smartGuides === false;
+    drawPanel();
+    paintOverlay();
+  });
+  body.querySelectorAll("[data-snap]").forEach((b) => b.onclick = () => {
+    if (b.dataset.snap === "point") ui.snapPoint = ui.snapPoint === false;
+    else ui.snapGrid = !ui.snapGrid;
+    drawPanel();
+  });
+  body.querySelectorAll("[data-pref]").forEach((b) => b.onclick = () => { ui.scaleStrokes = !ui.scaleStrokes; drawPanel(); });
+  body.querySelectorAll("[data-moveart]").forEach((b) => b.onclick = () => { ui.moveArt = !ui.moveArt; drawPanel(); });
+  body.querySelectorAll("[data-ab]").forEach((input) => input.onchange = () => commitArtboard(input.dataset.ab, input.value));
 }
 function commitField(field, value, live) {
   const d = doc();
@@ -2766,6 +3069,11 @@ function commitField(field, value, live) {
   if (field === "hex") {
     const c = hexToRgb(value);
     if (c) applyPaint(ui.paintTarget, { type: "solid", color: c });
+    return;
+  }
+  if (field === "keyInc") { ui.keyInc = Math.max(0.001, +value || 1); return; }
+  if (field === "abx" || field === "aby" || field === "abw" || field === "abh") {
+    commitArtboard({ abx: "x", aby: "y", abw: "w", abh: "h" }[field], value);
     return;
   }
   if (field === "opacity") {
@@ -2818,7 +3126,7 @@ function commitField(field, value, live) {
   }
   const b = selectionBounds(d.file, d.selection);
   if (!b || !nodes.length) return;
-  const v = +value;
+  const v = (+value) * (field === "x" || field === "y" || field === "w" || field === "h" ? unitSpec().per : 1);
   const rp = refPointOf(b, ui.refPoint ?? 4);
   if (field === "x") nodes.forEach((n) => translateNode(n, v - rp.x, 0));
   if (field === "y") nodes.forEach((n) => translateNode(n, 0, v - rp.y));
@@ -2857,6 +3165,7 @@ const HINTS = {
   eyedropper: [["Click", 1], [" an object to copy its attributes", 0]],
   gradient: [["Drag", 1], [" across a selected object to set the gradient direction", 0]],
   rotate: [["Drag", 1], [" to transform  |  ", 0], ["Alt+Click", 1], [" to set the reference point", 0]],
+  artboard: [["Click", 1], [" an artboard to edit it  |  ", 0], ["Drag", 1], [" to move it", 0]],
 };
 function drawHint() {
   const segs = HINTS[ui.tool] || HINTS[ui.tool === "ellipse" || ui.tool === "polygon" || ui.tool === "star" || ui.tool === "roundedRectangle" ? "rectangle" : ""] || [["Search", 1], [" commands and tools for this tool", 0]];
@@ -2868,7 +3177,7 @@ function status() {
   const tool = toolById(ui.tool);
   const nab = d?.file.document.artboards?.length || 0;
   const cur = d ? Math.min(d.artboard, Math.max(0, nab - 1)) : 0;
-  const shown = tool ? tool.label.replace(/ Tool$/, "") : "";
+  const shown = tool ? tool.label.replace(/ Tool$/, "") : (ui.tool === "artboard" ? "Artboard" : "");
   $("statusbar").innerHTML = `
     <button class="zoom" id="zoom-label">${d ? Math.round(d.zoom * 100) + "%" : ""} ${icon("chevron", 10)}</button>
     <button class="rot" id="rot-label">${d ? Math.round(d.viewRot || 0) + "°" : "0°"} ${icon("chevron", 10)}</button>
@@ -2929,7 +3238,10 @@ function openRotMenu(rect) {
 }
 function statusXY(p) {
   const el = $("xy");
-  if (el && p) el.textContent = `X: ${p.x.toFixed(2)} pt  Y: ${p.y.toFixed(2)} pt`;
+  if (!el || !p) return;
+  const u = unitSpec();
+  const x = p.x / u.per, y = p.y / u.per;
+  el.textContent = `X: ${x.toFixed(2)} ${u.suffix}  Y: ${y.toFixed(2)} ${u.suffix}`;
 }
 
 function paletteItems() {
@@ -3088,7 +3400,7 @@ function onKey(e) {
   if (e.key === "Delete" || e.key === "Backspace") { commands.delete(); return; }
   if (e.key === "Enter" && ui.pen) { ui.pen.curve ? finishCurve() : finishPen(false); return; }
   if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key) && doc()?.selection.length) {
-    const n = e.shiftKey ? 10 : 1;
+    const n = (ui.keyInc ?? 1) * unitSpec().per * (e.shiftKey ? 10 : 1);
     const dx = e.key === "ArrowLeft" ? -n : e.key === "ArrowRight" ? n : 0;
     const dy = e.key === "ArrowUp" ? -n : e.key === "ArrowDown" ? n : 0;
     pushHistory();
