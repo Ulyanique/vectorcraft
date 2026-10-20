@@ -138,7 +138,7 @@ function paintPath(node, path, rule, ctx) {
   }
   for (const s of strokes) {
     const paint = paintAttr(s.paint, path, ctx.defs, "stroke");
-    const w = s.width ?? 1;
+    const w = Math.max(s.width ?? 1, ctx?.minStroke || 0);
     const cap = (s.cap || "butt").toLowerCase();
     const join = (s.join || "miter").toLowerCase();
     const op = s.opacity ?? 1;
@@ -473,6 +473,24 @@ export function blendHit(node, p, tol = 6) {
     if (hitStroke(path, p, w)) return true;
   }
   return false;
+}
+
+/** Isolated thumbnail of `node`. `px` is the longest side in pixels; `minStroke` thickens hairlines. */
+export function thumbnailSVG(node, px = 64, opts = {}) {
+  const defs = [];
+  const body = renderNode(node, { defs, mode: "preview", opacity: 1, minStroke: opts.minStroke || 0 });
+  const b = nodeBounds(node) || { x0: 0, y0: 0, x1: 8, y1: 8 };
+  let x0 = b.x0, y0 = b.y0, x1 = b.x1, y1 = b.y1;
+  if (!(x1 > x0)) { x0 = 0; x1 = 8; }
+  if (!(y1 > y0)) { y0 = 0; y1 = 8; }
+  const bw = x1 - x0, bh = y1 - y0;
+  const pad = Math.max(bw, bh) * 0.06 + (opts.minStroke || 0) * 0.6;
+  const x = x0 - pad, y = y0 - pad, w = Math.max(1, bw + pad * 2), h = Math.max(1, bh + pad * 2);
+  const scale = px / Math.max(w, h);
+  const W = Math.max(1, Math.round(w * scale));
+  const H = Math.max(1, Math.round(h * scale));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${x} ${y} ${w} ${h}"><rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#fff"/>${defs.length ? `<defs>${defs.join("")}</defs>` : ""}${body}</svg>`;
+  return { svg, w: W, h: H };
 }
 
 export function artboardSVG(file) {

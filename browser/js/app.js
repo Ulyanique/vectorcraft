@@ -15,6 +15,7 @@ import { loadFontMetrics } from "./fontmetrics.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
+import { createLayers } from "./layers-panel.js";
 import { importSVG } from "./svg.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -163,6 +164,7 @@ function pushHistory() {
   if (d.history.length > 80) d.history.shift();
   d.future = [];
   d.dirty = true;
+  layersApi()?.clearThumbs();
 }
 function undo() {
   const d = doc();
@@ -170,6 +172,7 @@ function undo() {
   d.future.push(snapshot(d.file));
   restore(d.file, d.history.pop());
   d.selection = d.selection.filter((id) => indexNodes(d.file).map.has(id));
+  layersApi()?.clearThumbs();
   paint();
   refreshChrome();
 }
@@ -178,8 +181,19 @@ function redo() {
   if (!d?.future.length) return;
   d.history.push(snapshot(d.file));
   restore(d.file, d.future.pop());
+  layersApi()?.clearThumbs();
   paint();
   refreshChrome();
+}
+let _layers;
+function layersApi() {
+  if (!_layers) {
+    _layers = createLayers({
+      $, esc, toast, doc, file, ui,
+      pushHistory, paint, paintOverlay, refreshChrome, drawPanel, drawTaskbar, status, syncProxyFromSelection,
+    });
+  }
+  return _layers;
 }
 
 function selectedNodes() {
@@ -1549,10 +1563,10 @@ function placeArt(file, node) {
       list.splice(Math.max(0, idx), 0, node);
       return node;
     }
-    activeLayer(file).kind.children.unshift(node);
+    activeLayer(file, doc()?.currentLayer).kind.children.unshift(node);
     return node;
   }
-  addToLayer(file, node);
+  addToLayer(file, node, doc()?.currentLayer);
   return node;
 }
 function placeInside(file, node, targetId) {
@@ -2434,6 +2448,9 @@ function drawTaskbar() {
 }
 
 function drawPanel() {
+  const keepSearch = document.activeElement?.id === "layer-search";
+  const caret = keepSearch ? document.activeElement.selectionStart : 0;
+  const scroll = document.querySelector(".llist")?.scrollTop || 0;
   const rail = $("rail");
   rail.innerHTML = ICON_GROUPS.map((group) => group.map((id) => {
     const [label, ic] = PANEL_META[id];
@@ -2460,8 +2477,20 @@ function drawPanel() {
     document.body.appendChild(menu);
     menu.querySelectorAll(".mi").forEach((b) => b.onclick = () => { ui.panel = b.dataset.p; closePops(); drawPanel(); });
   };
+  $("pbody").classList.toggle("layers", ui.panel === "layers");
   $("pbody").innerHTML = panelHTML(ui.panel);
+  const list = document.querySelector(".llist");
+  if (list) list.scrollTop = scroll;
   wirePanel();
+  if (ui.panel === "layers") layersApi().wire();
+  if (keepSearch) {
+    const input = $("layer-search");
+    if (input) {
+      input.focus();
+      const c = Math.min(caret ?? 0, input.value.length);
+      input.setSelectionRange(c, c);
+    }
+  }
 }
 
 function panelHTML(id) {
@@ -2653,30 +2682,7 @@ function librariesHTML() {
     </div>`;
 }
 function layersHTML() {
-  const f = file();
-  if (!f) return `<p class="hint">No document.</p>`;
-  const sel = new Set(doc().selection);
-  const row = (n, depth) => {
-    const kids = childrenOf(n) || [];
-    const type = n.kind?.type;
-    const eye = n.visible === false ? "eyeOff" : "eye";
-    const lock = n.locked ? "lock" : "unlock";
-    const name = n.name || objectLabel(n) || type;
-    const self = `<div class="layer ${sel.has(n.id) ? "sel" : ""}" data-id="${n.id}" style="padding-left:${8 + depth * 12}px">
-      <button class="eye" data-eye="${n.id}">${icon(eye, 12)}</button>
-      <button class="lock" data-lock="${n.id}">${icon(lock, 12)}</button>
-      <i class="badge" style="background:${layerDot(n)}"></i>
-      <span class="nm">${esc(name)}</span>
-    </div>`;
-    const showKids = type === "layer" || type === "group";
-    return self + (showKids ? kids.map((c) => row(c, depth + 1)).join("") : "");
-  };
-  return `<div class="psec"><h3>Layers</h3>${f.document.layers.map((l) => row(l, 0)).join("")}</div>`;
-}
-function layerDot(n) {
-  if (n.kind?.type === "layer") return ["#e23d3d", "#378ef0", "#3cbf6e", "#f0b429", "#9b59b6"][(n.kind.color || 0) % 5];
-  const f = primaryFill(n);
-  return f?.type === "solid" ? rgbCss(f.color) : "#bbb";
+  return layersApi().html();
 }
 
 function wirePanel() {
