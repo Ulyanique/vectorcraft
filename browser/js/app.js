@@ -18,6 +18,7 @@ import {
   addSpineAnchor, bendSpineSegment, blendSpine, moveSpineAnchor, nearestOnSubpath, readBlendOptions, removeSpineAnchor, spinePointAt, stepsBetween, writeBlendOptions,
 } from "./blend.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
+import { METHODS, applyRecolor, artworkColors, colorHex, hexToColor, reduceColors } from "./recolor.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
 import { createLayers, layerColorCss } from "./layers-panel.js";
@@ -1343,6 +1344,7 @@ const commands = {
   expand: () => expandSelection(),
   makeBlend: () => makeBlendFromSelection(),
   blendOptions: () => openBlendOptions(),
+  recolor: () => openRecolor(),
   outerGlow: () => addGlow(),
   warpFlag: () => warpSelection("flag", 40),
   warpArc: () => warpSelection("arc", 35),
@@ -1694,6 +1696,116 @@ function expandSelection() {
 function openBlendOptions() {
   if (!doc()) { toast("Open a document first"); return; }
   openModal("blend");
+}
+
+function openRecolor() {
+  if (!doc()) { toast("Open a document first"); return; }
+  if (!selectedNodes().length) { toast("Select artwork to recolor"); return; }
+  if (!artworkColors(selectedNodes()).length) { toast("The selection has no colours"); return; }
+  openModal("recolor");
+}
+
+function recolorPreserve(back) {
+  return {
+    white: back.querySelector("#rc-white").checked,
+    black: back.querySelector("#rc-black").checked,
+    grays: back.querySelector("#rc-gray").checked,
+  };
+}
+
+function renderRecolorRows(back, rows) {
+  const box = back.querySelector("#rc-rows");
+  if (!rows.length) {
+    box.innerHTML = `<p class="hint">No colours to recolor. Clear Preserve to include white, black or gray.</p>`;
+    return;
+  }
+  box.innerHTML = rows.map((row, i) => {
+    const chips = row.from.map((c) => `<i style="background:${colorHex(c)}" title="${esc(colorHex(c))}"></i>`).join("");
+    return `<div class="recolor-row" data-i="${i}">
+      <span class="recolor-from">${chips}</span>
+      <span>→</span>
+      <input type="color" value="${colorHex(row.to)}" title="New color"/>
+      <button type="button" class="mini" data-exclude title="Exclude this row">Exclude</button>
+    </div>`;
+  }).join("");
+}
+
+function readRecolorRows(back, rows) {
+  back.querySelectorAll(".recolor-row").forEach((el) => {
+    const row = rows[+el.dataset.i];
+    if (!row) return;
+    const input = el.querySelector("input[type=color]");
+    if (input?.dataset.touched === "1") row.to = hexToColor(input.value);
+    row.exclude = el.classList.contains("excluded");
+  });
+  return rows;
+}
+
+function wireRecolor(back) {
+  const d = doc();
+  const before = snapshot(d.file);
+  let rows = [];
+  const roots = () => selectedNodes();
+  const countSel = back.querySelector("#rc-count");
+  const fillCounts = (n) => {
+    const cur = countSel.value;
+    countSel.innerHTML = `<option value="">Auto</option>` + Array.from({ length: n }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join("");
+    if ([...countSel.options].some((o) => o.value === cur)) countSel.value = cur;
+  };
+  const rebuild = () => {
+    const used = artworkColors(roots());
+    fillCounts(Math.max(1, used.length));
+    const count = countSel.value === "" ? null : +countSel.value;
+    rows = reduceColors(used, { count, method: back.querySelector("#rc-method").value, preserve: recolorPreserve(back) }).map;
+    renderRecolorRows(back, rows);
+    bindRows();
+  };
+  const preview = () => {
+    if (!back.querySelector("#rc-preview").checked) return;
+    restore(d.file, before);
+    readRecolorRows(back, rows);
+    applyRecolor(roots(), rows, back.querySelector("#rc-method").value);
+    paint();
+  };
+  const bindRows = () => {
+    back.querySelectorAll(".recolor-row").forEach((el) => {
+      const input = el.querySelector("input[type=color]");
+      input.oninput = () => { input.dataset.touched = "1"; preview(); };
+      el.querySelector("[data-exclude]").onclick = () => {
+        el.classList.toggle("excluded");
+        const off = el.classList.contains("excluded");
+        input.disabled = off;
+        el.querySelector("[data-exclude]").textContent = off ? "Include" : "Exclude";
+        preview();
+      };
+    });
+  };
+  const restoreArt = () => { restore(d.file, before); paint(); };
+  back.addEventListener("mousedown", (e) => { if (e.target === back) restoreArt(); }, true);
+  back.querySelectorAll("[data-x]").forEach((b) => b.onclick = () => { restoreArt(); back.remove(); });
+  countSel.onchange = () => { rebuild(); preview(); };
+  back.querySelector("#rc-method").onchange = () => preview();
+  for (const id of ["rc-white", "rc-black", "rc-gray"]) back.querySelector("#" + id).onchange = () => { rebuild(); preview(); };
+  back.querySelector("#rc-preview").onchange = () => {
+    if (back.querySelector("#rc-preview").checked) preview();
+    else restoreArt();
+  };
+  rebuild();
+  preview();
+  back.querySelector("#rc-ok").onclick = () => {
+    restore(d.file, before);
+    readRecolorRows(back, rows);
+    const method = back.querySelector("#rc-method").value;
+    const n = applyRecolor(roots(), rows, method);
+    if (!n) { paint(); back.remove(); return; }
+    const after = snapshot(d.file);
+    restore(d.file, before);
+    pushHistory();
+    restore(d.file, after);
+    back.remove();
+    paint();
+    refreshChrome();
+  };
 }
 
 function blendFieldsFrom(back) {
@@ -3089,6 +3201,10 @@ function menuItems(name) {
       { label: "Select All", cmd: "selectAll", sc: "Ctrl+A" },
       { label: "Deselect", cmd: "deselect", sc: "Ctrl+Shift+A" },
       { sep: true },
+      { label: "Edit Colors", items: [
+        { label: "Recolor Artwork…", cmd: "recolor" },
+      ] },
+      { sep: true },
       { label: "Preferences…", cmd: "prefs" },
     ],
     Object: [
@@ -3822,6 +3938,7 @@ function propertiesHTML(n, nodes) {
   <div class="psec"><h3>Quick Actions</h3>
     <div class="qa">
       ${selectedBlends().length ? `<button class="btn" data-cmd="blendOptions">Blend Options…</button>` : ""}
+      ${artworkColors(selectedNodes()).length > 1 ? `<button class="btn" data-cmd="recolor">Recolor</button>` : ""}
       <button class="btn" data-cmd="offsetPath">Offset Path</button>
       <button class="btn" data-cmd="simplify">Simplify</button>
       <button class="btn" data-cmd="bringFront">Arrange: Bring to Front</button>
@@ -4297,6 +4414,23 @@ function openModal(kind) {
       <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="bl-ok">OK</button></div>`;
     back.dataset.blend = "1";
   }
+  else if (kind === "recolor") {
+    inner = `<h2>Recolor Artwork</h2>
+      <p class="hint">Current colours take the new colour by the method. White and black stay unless you clear Preserve.</p>
+      <div class="row recolor-head"><label>Colors</label>
+        <select id="rc-count"><option value="">Auto</option></select>
+        <label>Method</label>
+        <select id="rc-method">${METHODS.map(([id, label]) => `<option value="${id}" ${id === "scaleTints" ? "selected" : ""}>${label}</option>`).join("")}</select>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="rc-white" checked/> White</label>
+        <label><input type="checkbox" id="rc-black" checked/> Black</label>
+        <label><input type="checkbox" id="rc-gray"/> Grays</label>
+      </div>
+      <div class="recolor-rows" id="rc-rows"></div>
+      <div class="row"><label><input type="checkbox" id="rc-preview" checked/> Preview</label></div>
+      <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="rc-ok">OK</button></div>`;
+  }
   else if (kind === "mesh") inner = `<h2>Create Gradient Mesh</h2>
     <div class="grid2">${numField("Rows", 4, "mrows")}${numField("Columns", 4, "mcols")}</div>
     <div class="row"><label style="width:90px;color:var(--text-dim)">Appearance</label>
@@ -4310,7 +4444,7 @@ function openModal(kind) {
       <div class="grid2">${numField("W", ab ? ab.x1 - ab.x0 : 800, "dw")}${numField("H", ab ? ab.y1 - ab.y0 : 600, "dh")}</div>
       <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="ds-ok">OK</button></div>`;
   }
-  back.innerHTML = `<div class="modal">${inner}</div>`;
+  back.innerHTML = `<div class="modal${kind === "recolor" ? " wide" : ""}">${inner}</div>`;
   document.body.appendChild(back);
   back.addEventListener("mousedown", (e) => { if (e.target === back) back.remove(); });
   back.querySelectorAll("[data-x]").forEach((b) => b.onclick = () => back.remove());
@@ -4362,6 +4496,7 @@ function openModal(kind) {
       refreshChrome();
     };
   }
+  if (kind === "recolor") wireRecolor(back);
   back.querySelector("#nd-ok")?.addEventListener("click", () => {
     const w = +back.querySelector("[data-field=nw]").value || 800;
     const h = +back.querySelector("[data-field=nh]").value || 600;

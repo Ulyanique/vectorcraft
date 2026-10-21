@@ -406,6 +406,16 @@ select.full:focus, input.full:focus { border-color: var(--accent); }
   width: 440px; max-width: calc(100vw - 32px); background: var(--panel); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: var(--shadow); padding: 16px 16px 12px;
 }
+.modal.wide { width: 520px; }
+.recolor-head label { color: var(--text-dim); flex: 0 0 auto; }
+.recolor-head select { flex: 1; min-width: 0; height: 22px; background: var(--input); border: 1px solid transparent; border-radius: 3px; }
+.recolor-rows { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow: auto; margin: 8px 0; }
+.recolor-row { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+.recolor-from { display: flex; flex-wrap: wrap; gap: 2px; flex: 1; min-width: 0; }
+.recolor-from i { width: 16px; height: 16px; border-radius: 2px; border: 1px solid var(--border-soft); display: inline-block; }
+.recolor-row input[type="color"] { width: 36px; height: 22px; padding: 0; border: 0; background: none; }
+.recolor-row.excluded { opacity: 0.45; }
+.recolor-row .mini { flex: 0 0 auto; }
 .modal h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
 .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .btn { height: 26px; padding: 0 12px; border-radius: 4px; background: var(--widget); border: 1px solid var(--border-soft); }

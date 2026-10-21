@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
 import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
 import { addSpineAnchor, blendSpine, moveSpineAnchor, readBlendOptions, removeSpineAnchor, stepsBetween, writeBlendOptions } from "./blend.js";
+import { applyRecolor, artworkColors, cluster, colorFromKey, colorKey, keepsNeutral, mapColor, neutralOf, reduceColors, tinted } from "./recolor.js";
 import { loadFile } from "./model.js";
 import { ellipsePath, pathD, toRgb, warpDocPoint } from "./geom.js";
 import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
@@ -127,6 +128,71 @@ const upright = expandBlend({
 const turned = upright[1].kind.path.subpaths[0].anchors[0].p;
 if (Math.abs(turned.x - 10) > 1e-3 || Math.abs(turned.y - 50) > 1e-3) throw new Error("align to path " + JSON.stringify(turned));
 console.log("blend options", read.spacing, "turned", turned.x.toFixed(2), turned.y.toFixed(2));
+
+function closeColor(a, b) {
+  if (a.model !== b.model) return false;
+  const keys = a.model === "cmyk" ? ["c", "m", "y", "k"] : a.model === "gray" ? ["k"] : a.model === "lab" ? ["l", "a", "b"] : ["r", "g", "b"];
+  return keys.every((k) => Math.abs((a[k] ?? 0) - (b[k] ?? 0)) < (a.model === "lab" ? 0.1 : 1e-3));
+}
+if (colorKey({ model: "rgb", r: 1, g: 0.5, b: 0 }) !== "rgb 255 127.5 0") throw new Error("rgb key");
+if (colorKey({ model: "cmyk", c: 0, m: 1, y: 1, k: 0 }) !== "cmyk 0 100 100 0") throw new Error("cmyk key");
+if (colorKey({ model: "gray", k: 0.4 }) !== "gray 40") throw new Error("gray key");
+if (colorKey({ model: "lab", l: 55, a: 60.5, b: -40.25 }) !== "lab 55 60.5 -40.25") throw new Error("lab key");
+if (colorKey(colorFromKey("rgb 18 52 86")) !== "rgb 18 52 86") throw new Error("key round trip");
+if (colorKey({ model: "cmyk", c: 0, m: 1, y: 1, k: 0 }) === colorKey({ model: "rgb", r: 1, g: 0, b: 0 })) throw new Error("cmyk red is not rgb red");
+const inkRed = { model: "cmyk", c: 0, m: 1, y: 1, k: 0 };
+const pink = tinted(inkRed, 0.4);
+const scaled = mapColor("scaleTints", [pink, inkRed], { model: "cmyk", c: 1, m: 0.5, y: 0, k: 0 }, pink);
+if (!closeColor(scaled, { model: "cmyk", c: 0.4, m: 0.2, y: 0, k: 0 })) throw new Error("scale tints " + JSON.stringify(scaled));
+const other = { model: "cmyk", c: 0, m: 0.3, y: 0.8, k: 0 };
+const kept = mapColor("preserveTints", [inkRed, tinted(inkRed, 0.5), other], { model: "cmyk", c: 1, m: 0, y: 0, k: 0 }, other);
+if (!closeColor(kept, { model: "cmyk", c: 1, m: 0, y: 0, k: 0 })) throw new Error("preserve tints should leave a non-tint exact");
+const hueRow = [{ model: "rgb", r: 0.9, g: 0.2, b: 0.2 }, { model: "rgb", r: 0.5, g: 0.1, b: 0.1 }, { model: "rgb", r: 1, g: 0.7, b: 0.7 }];
+const hueTo = { model: "rgb", r: 0, g: 0.4, b: 1 };
+if (!hueRow.every((c) => closeColor(mapColor("exact", hueRow, hueTo, c), hueTo))) throw new Error("exact");
+const grayMapped = mapColor("exact", [{ model: "gray", k: 0.3 }], hueTo, { model: "gray", k: 0.3 });
+if (grayMapped.model !== "gray") throw new Error("exact should keep gray");
+const colors = [
+  { model: "rgb", r: 1, g: 0, b: 0 },
+  { model: "rgb", r: 0, g: 0, b: 1 },
+  { model: "rgb", r: 0.9, g: 0.1, b: 0.05 },
+  { model: "rgb", r: 0.1, g: 0.1, b: 0.9 },
+  { model: "rgb", r: 1, g: 0.2, b: 0.2 },
+];
+const rows = cluster(colors, [5, 4, 1, 1, 1], 2).map((r) => r.join(","));
+if (rows.join("|") !== "0,2,4|1,3") throw new Error("cluster " + rows.join("|"));
+if (neutralOf({ model: "rgb", r: 1, g: 1, b: 1 }) !== "white" || !keepsNeutral({ model: "rgb", r: 0, g: 0, b: 0 })) throw new Error("preserve black and white");
+const art = {
+  id: 1,
+  appearance: { items: [{ kind: "fill", paint: { type: "solid", color: { model: "rgb", r: 1, g: 0, b: 0 } } }] },
+  kind: { type: "group", children: [{
+    id: 2,
+    appearance: { items: [] },
+    kind: { type: "mesh", rows: 1, cols: 1, points: [{ p: { x: 0, y: 0 }, color: { model: "rgb", r: 0, g: 0, b: 1 } }] },
+  }] },
+};
+if (artworkColors([art]).length !== 2) throw new Error("artwork colors");
+const reduced = reduceColors(artworkColors([art]), { count: 1, method: "exact", preserve: { white: false, black: false, grays: false } });
+if (reduced.map.length !== 1 || reduced.map[0].from.length !== 2) throw new Error("reduce to one row");
+applyRecolor([art], [{ from: [{ model: "rgb", r: 1, g: 0, b: 0 }], to: { model: "rgb", r: 0, g: 1, b: 0 } }, { from: [{ model: "rgb", r: 0, g: 0, b: 1 }], to: hueTo, exclude: true }], "exact");
+if (art.appearance.items[0].paint.color.g !== 1) throw new Error("fill was not recolored");
+if (art.kind.children[0].kind.points[0].color.b !== 1) throw new Error("excluded mesh colour changed");
+const grad = {
+  id: 3,
+  appearance: { items: [{ kind: "fill", paint: { type: "gradient", gradient: { stops: [
+    { offset: 0, color: { model: "rgb", r: 1, g: 0, b: 0 } },
+    { offset: 1, color: { model: "rgb", r: 0, g: 0, b: 1 } },
+  ] } } }] },
+  kind: { type: "text", runs: [{ style: { fill: { type: "solid", color: { model: "rgb", r: 1, g: 1, b: 0 } }, stroke: { type: "none" } } }] },
+};
+applyRecolor([grad], [
+  { from: [{ model: "rgb", r: 1, g: 0, b: 0 }, { model: "rgb", r: 0, g: 0, b: 1 }], to: { model: "rgb", r: 0, g: 1, b: 0 } },
+  { from: [{ model: "rgb", r: 1, g: 1, b: 0 }], to: { model: "rgb", r: 0, g: 0, b: 0 } },
+], "exact");
+const stops = grad.appearance.items[0].paint.gradient.stops;
+if (stops[0].color.g !== 1 || stops[1].color.g !== 1) throw new Error("gradient stops were not recolored");
+if (grad.kind.runs[0].style.fill.color.r !== 0) throw new Error("text fill was not recolored");
+console.log("recolor", rows.join("|"));
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];
