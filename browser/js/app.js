@@ -1,6 +1,6 @@
 import {
   applyXf, center, clamp, contains, dist, ellipsePath, flattenPath, hitFill, hitStroke,
-  ident, linePath, mulXf, offsetRing, pathBounds, pathD, pathFromAnchors, polygonPath, rgbCss, rgbToHex,
+  ident, lerp, lerpColor, linePath, mulXf, offsetRing, pathBounds, pathD, pathFromAnchors, polygonPath, rgbCss, rgbToHex,
   hexToRgb, rotateXf, roundedRectPath, scaleXf, simplify, starPath, translateXf, union,
 } from "./geom.js";
 import {
@@ -13,6 +13,7 @@ import {
 } from "./model.js";
 import { loadFontMetrics } from "./fontmetrics.js";
 import { loadFace, outlineGlyphs } from "./outlines.js";
+import { locateUv, meshFromPath } from "./mesh.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
@@ -493,12 +494,16 @@ function paintOverlay() {
     parts.push(`<rect x="${x}" y="${y}" width="${Math.abs(p1.x - p0.x)}" height="${Math.abs(p1.y - p0.y)}" fill="none" stroke="#4f80ff" stroke-dasharray="4 3"/>`);
   }
   // A single artboard is unlabeled unless the Artboard tool is up; several are numbered.
+  // The name sits above the artboard's own top-left corner and stays within its screen width.
   if (boards.length > 1 || ui.tool === "artboard") {
     boards.forEach((a, i) => {
       const r = a.rect;
       const s = docToScreen({ x: r.x0, y: r.y0 });
-      const name = boards.length > 1 ? `${String(i + 1).padStart(2, "0")} - ${a.name || "Artboard"}` : (a.name || "Artboard");
-      parts.push(`<text x="${s.x}" y="${s.y - 6}" fill="#b0b0b0" font-size="11" font-family="Inter, sans-serif">${esc(name)}</text>`);
+      const far = docToScreen({ x: r.x1, y: r.y0 });
+      const width = Math.hypot(far.x - s.x, far.y - s.y);
+      const name = fitArtboardLabel(i, a.name, width);
+      if (!name) return;
+      parts.push(`<text x="${s.x}" y="${s.y - 6}" fill="var(--text-dim)" font-size="11" font-family="Inter, sans-serif">${esc(name)}</text>`);
     });
   }
   paintPerspective(parts);
@@ -1167,6 +1172,11 @@ const commands = {
   pathfinderMinus: () => pathfinder("difference"),
   pathfinderIntersect: () => pathfinder("intersect"),
   pathfinderExclude: () => pathfinder("xor"),
+  createMesh: () => {
+    const nodes = selectedNodes().filter((n) => n.kind?.type === "path" || n.kind?.type === "compound");
+    if (!nodes.length) { toast("Select a path or compound path"); return; }
+    openModal("mesh");
+  },
   expand: () => expandSelection(),
   makeBlend: () => makeBlendFromSelection(),
   outerGlow: () => addGlow(),
@@ -1274,6 +1284,108 @@ function ringOf(node) {
   const flat = flattenPath(node.kind.path, 0.8)[0];
   return flat && flat.pts.length >= 3 ? flat.pts : null;
 }
+function pathDataOf(node) {
+  const k = node?.kind;
+  if (k?.type === "path") return k.path;
+  if (k?.type === "compound") {
+    const subpaths = [];
+    for (const c of k.children || []) if (c.kind?.path?.subpaths) subpaths.push(...c.kind.path.subpaths);
+    return subpaths.length ? { subpaths } : null;
+  }
+  return null;
+}
+
+function meshSampler(node, path) {
+  let paint = primaryFill(node);
+  if ((!paint || paint.type === "none") && node.kind?.type === "compound") {
+    paint = (node.kind.children || []).map(primaryFill).find((p) => p && p.type !== "none") || paint;
+  }
+  if (!paint || paint.type === "none") return () => ({ color: { model: "rgb", r: 1, g: 1, b: 1 }, opacity: 1 });
+  if (paint.type === "solid") return () => ({ color: paint.color || { model: "rgb", r: 0, g: 0, b: 0 }, opacity: 1 });
+  if (paint.type !== "gradient") return () => ({ color: { model: "rgb", r: 1, g: 1, b: 1 }, opacity: 1 });
+  const b = pathBounds(path) || { x0: 0, y0: 0, x1: 1, y1: 1 };
+  const g = paint.gradient || {};
+  const stops = (g.stops || []).slice().sort((a, c) => (a.offset ?? 0) - (c.offset ?? 0));
+  return (p) => {
+    if (!stops.length) return { color: { model: "rgb", r: 0, g: 0, b: 0 }, opacity: 1 };
+    let t = 0.5;
+    if (g.kind === "Radial") {
+      const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+      const r = Math.max(b.x1 - b.x0, b.y1 - b.y0) / 2 || 1;
+      t = Math.hypot(p.x - cx, p.y - cy) / r;
+    } else {
+      const angle = (paint.angle ?? g.angle ?? 0) * Math.PI / 180;
+      const dx = Math.cos(angle), dy = -Math.sin(angle);
+      const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+      const len = Math.abs(dx) * (b.x1 - b.x0) / 2 + Math.abs(dy) * (b.y1 - b.y0) / 2 || 1;
+      const x1 = cx - dx * len, y1 = cy - dy * len;
+      const vx = dx * len * 2, vy = dy * len * 2;
+      const den = vx * vx + vy * vy || 1;
+      t = ((p.x - x1) * vx + (p.y - y1) * vy) / den;
+    }
+    if (t <= (stops[0].offset ?? 0)) return { color: stops[0].color, opacity: stops[0].opacity ?? 1 };
+    const last = stops[stops.length - 1];
+    if (t >= (last.offset ?? 1)) return { color: last.color, opacity: last.opacity ?? 1 };
+    for (let i = 0; i < stops.length - 1; i++) {
+      const a = stops[i], bstop = stops[i + 1];
+      const o0 = a.offset ?? 0, o1 = bstop.offset ?? 1;
+      if (t >= o0 && t <= o1) {
+        const u = o1 === o0 ? 0 : (t - o0) / (o1 - o0);
+        return { color: lerpColor(a.color, bstop.color, u), opacity: lerp(a.opacity ?? 1, bstop.opacity ?? 1, u) };
+      }
+    }
+    return { color: last.color, opacity: last.opacity ?? 1 };
+  };
+}
+
+function turnIntoMesh(node, opts) {
+  const path = pathDataOf(node);
+  if (!path) return false;
+  const mesh = meshFromPath(path, { ...opts, sample: meshSampler(node, path) });
+  if (!mesh) return false;
+  node.kind = { type: "mesh", rows: mesh.rows, cols: mesh.cols, points: mesh.points };
+  return true;
+}
+
+function createMeshes(opts) {
+  const d = doc();
+  if (!d) return;
+  const nodes = selectedNodes().filter((n) => n.kind?.type === "path" || n.kind?.type === "compound");
+  if (!nodes.length) { toast("Select a path or compound path"); return; }
+  pushHistory();
+  let n = 0;
+  for (const node of nodes) if (turnIntoMesh(node, opts)) n++;
+  if (!n) { d.history.pop(); toast("Could not build a mesh from the selection"); return; }
+  paint();
+  refreshChrome();
+}
+
+function meshClick(p) {
+  const hit = hitAt(p, true);
+  if (!hit) { toast("Click a filled path"); gesture.on = false; return; }
+  const { parent } = indexNodes(file());
+  const par = parent.get(hit.id);
+  const node = par?.kind?.type === "compound" ? par : hit;
+  if (node.kind?.type !== "path" && node.kind?.type !== "compound") {
+    toast("Click a filled path");
+    gesture.on = false;
+    return;
+  }
+  const path = pathDataOf(node);
+  const at = path ? locateUv(path, p) : null;
+  pushHistory();
+  if (!turnIntoMesh(node, { rows: 1, cols: 1, appearance: "flat", highlight: 100, at })) {
+    doc().history.pop();
+    toast("Could not build a mesh from that path");
+    gesture.on = false;
+    return;
+  }
+  doc().selection = [node.id];
+  gesture.on = false;
+  paint();
+  refreshChrome();
+}
+
 function pathfinder(op) {
   const d = doc();
   const nodes = selectedNodes().filter((n) => n.kind?.type === "path");
@@ -1666,7 +1778,7 @@ function onDown(e) {
   if (tool === "smooth") { gesture.mode = "smooth"; return; }
   if (tool === "width") { gesture.mode = "width"; return; }
   if (tool === "gradient") { gesture.mode = "gradient"; return; }
-  if (tool === "mesh") { toast("Gradient mesh is shown for documents that contain one. Use the Gradient tool to recolor a fill."); gesture.on = false; }
+  if (tool === "mesh") { meshClick(p); return; }
 }
 
 function onMove(e) {
@@ -2588,6 +2700,8 @@ function menuItems(name) {
         { label: "Intersect", cmd: "pathfinderIntersect" },
         { label: "Exclude", cmd: "pathfinderExclude" },
       ] },
+      { sep: true },
+      { label: "Create Gradient Mesh…", cmd: "createMesh" },
     ],
     Type: [
       { label: "Size +", run: () => bumpSize(2) },
@@ -3352,10 +3466,32 @@ function transparencyHTML(n) {
 function librariesHTML() {
   const f = file();
   const styles = f?.document.graphic_styles || f?.document.graphicStyles || [];
+  const groups = f?.document.swatch_groups || f?.document.swatchGroups || [];
+  const groupHTML = groups.map((g) => `<div class="psec"><h3>${esc(g.name || "Swatches")}</h3><div class="swatches">${(g.swatches || []).map((s) => {
+    const col = s.paint?.color;
+    const bg = col ? rgbCss(col) : "#888";
+    const hex = col ? rgbToHex(col) : "";
+    return `<button class="swatch" data-hex="${hex}" style="background:${bg}" title="${esc(s.name || "")}"></button>`;
+  }).join("")}</div></div>`).join("");
   return `<div class="psec"><h3>Swatches</h3>${swatchGrid()}</div>
+    ${groupHTML}
     <div class="psec"><h3>Graphic styles</h3>
       ${styles.length ? styles.map((s, i) => `<button class="mi" data-style="${i}"><span>${esc(s.name || "Style " + (i + 1))}</span></button>`).join("") : `<p class="hint">This document has no graphic styles.</p>`}
     </div>`;
+}
+
+function fitArtboardLabel(index, name, screenWidth) {
+  if (!Number.isFinite(screenWidth) || screenWidth < 24) return "";
+  const text = `${String(index + 1).padStart(2, "0")} - ${name || "Artboard"}`;
+  const measure = (s) => {
+    if (!fitArtboardLabel.ctx) fitArtboardLabel.ctx = document.createElement("canvas").getContext("2d");
+    fitArtboardLabel.ctx.font = "11px Inter, sans-serif";
+    return fitArtboardLabel.ctx.measureText(s).width;
+  };
+  if (measure(text) <= screenWidth) return text;
+  let s = text;
+  while (s.length > 1 && measure(s + "…") > screenWidth) s = s.slice(0, -1);
+  return s + "…";
 }
 function layersHTML() {
   return layersApi().html();
@@ -3567,6 +3703,7 @@ const HINTS = {
   artboard: [["Click", 1], [" an artboard to edit it  |  ", 0], ["Drag", 1], [" to move it", 0]],
   perspectiveSelection: [["Drag", 1], [" to move in perspective  |  ", 0], ["Alt+Drag", 1], [" to copy  |  ", 0], ["Drag a handle", 1], [" to scale in perspective", 0]],
   perspectiveGrid: [["Drag", 1], [" a handle to reshape the grid  |  ", 0], ["1–4", 1], [" pick a plane", 0]],
+  mesh: [["Click", 1], [" a filled path to make a gradient mesh  |  ", 0], ["Object", 1], [" › Create Gradient Mesh… sets the rows", 0]],
 };
 function drawHint() {
   const segs = HINTS[ui.tool] || HINTS[ui.tool === "ellipse" || ui.tool === "polygon" || ui.tool === "star" || ui.tool === "roundedRectangle" ? "rectangle" : ""] || [["Search", 1], [" commands and tools for this tool", 0]];
@@ -3702,6 +3839,12 @@ function openModal(kind) {
     Ctrl+Z undo · Ctrl+S save · Ctrl+E export SVG · Ctrl+0 fit · Ctrl+G group · Del delete<br/>
     Arrows nudge · Shift+arrows nudge 10 · [ ] arrange · Ctrl+K search</p>
     <div class="actions"><button class="btn primary" data-x>Close</button></div>`;
+  else if (kind === "mesh") inner = `<h2>Create Gradient Mesh</h2>
+    <div class="grid2">${numField("Rows", 4, "mrows")}${numField("Columns", 4, "mcols")}</div>
+    <div class="row"><label style="width:90px;color:var(--text-dim)">Appearance</label>
+      <select class="full" id="mesh-look"><option value="flat">Flat</option><option value="center">To Center</option><option value="edge">To Edge</option></select></div>
+    <div class="row"><label style="width:90px;color:var(--text-dim)">Highlight</label><input class="full" data-field="mhi" type="number" min="0" max="100" value="100"/></div>
+    <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="mesh-ok">OK</button></div>`;
   else if (kind === "setup") {
     const ab = d?.file.document.artboards?.[0]?.rect;
     inner = `<h2>Document Setup</h2>
@@ -3728,6 +3871,14 @@ function openModal(kind) {
     $("ruler-v").style.display = ui.rulers ? "" : "none";
     paintRulers();
     back.remove();
+  });
+  back.querySelector("#mesh-ok")?.addEventListener("click", () => {
+    const rows = Math.max(1, Math.min(200, +back.querySelector("[data-field=mrows]").value || 4));
+    const cols = Math.max(1, Math.min(200, +back.querySelector("[data-field=mcols]").value || 4));
+    const appearance = back.querySelector("#mesh-look").value || "flat";
+    const highlight = Math.max(0, Math.min(100, +back.querySelector("[data-field=mhi]").value || 0));
+    back.remove();
+    createMeshes({ rows, cols, appearance, highlight });
   });
   back.querySelector("#ds-ok")?.addEventListener("click", () => {
     if (!d) return;

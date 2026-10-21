@@ -2,8 +2,31 @@ import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
 import { renderDocument, repeatTransforms } from "./render.js";
 import { loadFile } from "./model.js";
-import { warpDocPoint } from "./geom.js";
+import { ellipsePath, toRgb, warpDocPoint } from "./geom.js";
+import { meshFromPath } from "./mesh.js";
 import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
+
+const gray = toRgb({ model: "gray", k: 0.9 });
+if (Math.abs(gray.r - 0.1) > 1e-6) throw new Error("gray ink should be 1-k, got " + gray.r);
+
+const rect = { subpaths: [{ closed: true, anchors: [
+  { p: { x: 0, y: 0 }, in: { x: 0, y: 0 }, out: { x: 0, y: 0 }, kind: "Corner" },
+  { p: { x: 100, y: 0 }, in: { x: 100, y: 0 }, out: { x: 100, y: 0 }, kind: "Corner" },
+  { p: { x: 100, y: 100 }, in: { x: 100, y: 100 }, out: { x: 100, y: 100 }, kind: "Corner" },
+  { p: { x: 0, y: 100 }, in: { x: 0, y: 100 }, out: { x: 0, y: 100 }, kind: "Corner" },
+] }] };
+const mesh = meshFromPath(rect, { rows: 2, cols: 2, color: { model: "rgb", r: 1, g: 0, b: 0 }, appearance: "center", highlight: 100 });
+if (!mesh || mesh.rows !== 2 || mesh.points.length !== 9) throw new Error("mesh grid");
+const corner = mesh.points[0];
+if (Math.hypot(corner.p.x, corner.p.y) > 1e-4) throw new Error("mesh corner " + JSON.stringify(corner.p));
+const mid = mesh.points[1 * 3 + 1];
+if (Math.abs(mid.p.x - 50) > 1e-3 || Math.abs(mid.p.y - 50) > 1e-3) throw new Error("mesh centre " + JSON.stringify(mid.p));
+if (mid.color.r < 0.99 || mid.color.g < 0.99) throw new Error("center highlight " + JSON.stringify(mid.color));
+if (corner.color.r < 0.99 || corner.color.g > 0.01) throw new Error("corner stays red " + JSON.stringify(corner.color));
+const disk = meshFromPath(ellipsePath(50, 50, 40, 40), { rows: 2, cols: 2, appearance: "flat" });
+const hub = disk.points[1 * 3 + 1].p;
+if (Math.hypot(hub.x - 50, hub.y - 50) > 2) throw new Error("circle mesh centre " + JSON.stringify(hub));
+console.log("mesh", mesh.points.length, "circle hub", hub.x.toFixed(2), hub.y.toFixed(2));
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];

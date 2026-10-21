@@ -16,7 +16,8 @@ export function same(a, b, e = 1e-4) { return Math.abs(a.x - b.x) < e && Math.ab
 export function rgbCss(c, a = 1) {
   if (!c) return `rgba(0,0,0,${a})`;
   if (c.model === "gray") {
-    const v = Math.round(clamp(c.k ?? c.v ?? 0, 0, 1) * 255);
+    // Illustrator gray is ink: 0 = white, 1 = black.
+    const v = Math.round(clamp(1 - (c.k ?? c.v ?? 0), 0, 1) * 255);
     return `rgba(${v},${v},${v},${a})`;
   }
   if (c.model === "cmyk") {
@@ -43,7 +44,7 @@ export function hexToRgb(hex) {
 export function rgbToHex(c) {
   const ch = (x) => Math.round(clamp(x, 0, 1) * 255).toString(16).padStart(2, "0");
   if (!c) return "#000000";
-  if (c.model === "gray") { const v = ch(c.k ?? 0); return `#${v}${v}${v}`; }
+  if (c.model === "gray") { const v = ch(1 - (c.k ?? 0)); return `#${v}${v}${v}`; }
   if (c.model === "cmyk") {
     const css = rgbCss(c);
     const m = css.match(/rgba?\((\d+),(\d+),(\d+)/);
@@ -64,7 +65,7 @@ export function toRgb(c) {
     const C = c.c ?? 0, M = c.m ?? 0, Y = c.y ?? 0, K = c.k ?? 0;
     return { r: 1 - Math.min(1, C * (1 - K) + K), g: 1 - Math.min(1, M * (1 - K) + K), b: 1 - Math.min(1, Y * (1 - K) + K) };
   }
-  if (c.model === "gray") { const v = c.k ?? 0; return { r: v, g: v, b: v }; }
+  if (c.model === "gray") { const v = 1 - (c.k ?? 0); return { r: v, g: v, b: v }; }
   return { r: c.r ?? 0, g: c.g ?? 0, b: c.b ?? 0 };
 }
 

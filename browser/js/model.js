@@ -637,7 +637,7 @@ export function toGray(node) {
     const c = p.color;
     const r = c.r ?? 0, g = c.g ?? 0, b = c.b ?? 0;
     const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    p.color = { model: "gray", k: y };
+    p.color = { model: "gray", k: 1 - y };
   };
   for (const it of node.appearance?.items || []) paint(it.paint);
   const kids = childrenOf(node);
