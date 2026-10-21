@@ -6,7 +6,7 @@ import {
 } from "./geom.js";
 import { childrenOf, nodeBounds } from "./model.js";
 import { cachedFace, outlineGlyphs } from "./outlines.js";
-import { placeStep, spineActive } from "./blend.js";
+import { placeStep, spineActive, stepsBetween } from "./blend.js";
 
 let gid = 1;
 function nextId(prefix) { return `${prefix}${gid++}`; }
@@ -244,13 +244,12 @@ function placedKey(node, keys, spec, i) {
 function renderBlend(node, k, ctx) {
   const keys = k.children || [];
   if (keys.length < 2) return keys.map((c) => renderNode(c, ctx)).join("");
-  const steps = k.spec?.spacing?.steps ?? 20;
   const spec = k.spec;
   const parts = [];
   for (let i = 0; i < keys.length - 1; i++) {
     const a = keys[i], b = keys[i + 1];
     parts.push(renderNode(placedKey(a, keys, spec, i), { ...ctx, opacity: (a.opacity ?? 1) }));
-    const n = Math.max(1, Math.min(240, steps));
+    const n = stepsBetween(keys, spec, i);
     for (let j = 1; j <= n; j++) {
       const t = j / (n + 1);
       const mid = lerpNode(a, b, t);
@@ -575,10 +574,10 @@ export function expandBlend(node) {
   const keys = node.kind?.children || [];
   if (keys.length < 2) return keys.map((k) => JSON.parse(JSON.stringify(k)));
   const spec = node.kind.spec;
-  const steps = Math.max(1, Math.min(240, spec?.spacing?.steps ?? 12));
   const out = [];
   for (let i = 0; i < keys.length - 1; i++) {
     out.push(placedKey(keys[i], keys, spec, i));
+    const steps = stepsBetween(keys, spec, i);
     for (let j = 1; j <= steps; j++) {
       const t = j / (steps + 1);
       const mid = lerpNode(keys[i], keys[i + 1], t);
@@ -596,10 +595,10 @@ export function blendHit(node, p, tol = 6) {
   const keys = node.kind?.children || [];
   if (keys.length < 2) return false;
   const spec = node.kind.spec;
-  const steps = Math.min(40, spec?.spacing?.steps ?? 12);
   const samples = [];
   for (let i = 0; i < keys.length - 1; i++) {
     samples.push(placedKey(keys[i], keys, spec, i));
+    const steps = Math.min(40, stepsBetween(keys, spec, i));
     for (let j = 1; j <= steps; j++) {
       const t = j / (steps + 1);
       const mid = lerpNode(keys[i], keys[i + 1], t);

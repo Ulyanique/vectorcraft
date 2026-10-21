@@ -15,7 +15,7 @@ import { loadFontMetrics } from "./fontmetrics.js";
 import { loadFace, outlineGlyphs } from "./outlines.js";
 import { addLinesAt, locateUv, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
 import {
-  addSpineAnchor, bendSpineSegment, blendSpine, moveSpineAnchor, nearestOnSubpath, removeSpineAnchor, spinePointAt,
+  addSpineAnchor, bendSpineSegment, blendSpine, moveSpineAnchor, nearestOnSubpath, readBlendOptions, removeSpineAnchor, spinePointAt, stepsBetween, writeBlendOptions,
 } from "./blend.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
@@ -154,6 +154,7 @@ const ui = {
   clipboard: null,
   pen: null,
   blendPick: null,
+  blendDefaults: { spacing: "smooth", steps: 5, distance: 10, orientation: "page" },
   guides: null,
   space: false,
   query: "",
@@ -1341,6 +1342,7 @@ const commands = {
   },
   expand: () => expandSelection(),
   makeBlend: () => makeBlendFromSelection(),
+  blendOptions: () => openBlendOptions(),
   outerGlow: () => addGlow(),
   warpFlag: () => warpSelection("flag", 40),
   warpArc: () => warpSelection("arc", 35),
@@ -1689,6 +1691,50 @@ function expandSelection() {
   paint(); refreshChrome();
 }
 
+function openBlendOptions() {
+  if (!doc()) { toast("Open a document first"); return; }
+  openModal("blend");
+}
+
+function blendFieldsFrom(back) {
+  return {
+    spacing: back.querySelector("#bl-spacing").value,
+    steps: +back.querySelector("[data-field=blsteps]").value,
+    distance: +back.querySelector("[data-field=bldist]").value,
+    orientation: back.querySelector(".orient.on")?.dataset.orient || "page",
+  };
+}
+
+function syncBlendForm(back, targets) {
+  const mode = back.querySelector("#bl-spacing")?.value;
+  if (!mode) return;
+  const stepsWrap = back.querySelector("[data-bl=steps]");
+  const distWrap = back.querySelector("[data-bl=distance]");
+  if (stepsWrap) stepsWrap.hidden = mode === "distance";
+  if (distWrap) distWrap.hidden = mode !== "distance";
+  const input = back.querySelector("[data-field=blsteps]");
+  if (!input) return;
+  if (!input.dataset.typed) input.dataset.typed = input.value;
+  if (mode === "smooth") {
+    const keys = targets[0]?.kind?.children || [];
+    input.value = keys.length >= 2 ? stepsBetween(keys, { spacing: "smoothColor" }, 0) : input.dataset.typed;
+    input.disabled = true;
+  } else {
+    input.value = input.dataset.typed;
+    input.disabled = mode !== "steps";
+  }
+}
+
+function previewBlendOptions(back, targets, mark) {
+  if (!targets.length || !back.querySelector("#bl-preview")?.checked) return false;
+  const fields = blendFieldsFrom(back);
+  for (const blend of targets) writeBlendOptions(blend.kind.spec || (blend.kind.spec = {}), fields);
+  if (mark) mark();
+  paint();
+  syncBlendForm(back, targets);
+  return true;
+}
+
 function makeBlendFromSelection() {
   const d = doc();
   const nodes = selectedNodes();
@@ -1704,7 +1750,7 @@ function makeBlendFromSelection() {
   const g = blankNode(d.file.document.next_id++, {
     type: "blend",
     children: picked,
-    spec: { spacing: { steps: 16 }, alignToPage: true },
+    spec: writeBlendOptions({}, ui.blendDefaults),
   }, { items: [] });
   g.name = "Blend";
   g.opacity = 1;
@@ -2064,7 +2110,11 @@ function onDown(e) {
     return;
   }
   if (tool === "shapeBuilder" || tool === "shaper") { gesture.mode = "builder"; gesture.pts = [p]; return; }
-  if (tool === "blend") { blendClick(p); return; }
+  if (tool === "blend") {
+    if (e.altKey) { openBlendOptions(); return; }
+    blendClick(p);
+    return;
+  }
   if (tool === "addAnchor") { addAnchorAt(p); return; }
   if (tool === "deleteAnchor") { deleteAnchorAt(p); return; }
   if (tool === "anchorPoint") { convertAnchor(p); return; }
@@ -3064,6 +3114,7 @@ function menuItems(name) {
       { sep: true },
       { label: "Blend", items: [
         { label: "Make", cmd: "makeBlend" },
+        { label: "Blend Options…", cmd: "blendOptions" },
         { label: "Expand", cmd: "expand" },
       ] },
       { label: "Pathfinder", items: [
@@ -3269,11 +3320,19 @@ function drawToolbar() {
   tb.innerHTML = `<div class="tb-scroll">${parts.join("")}</div>${proxy}`;
   tb.querySelectorAll(".tool").forEach((btn) => {
     btn.onclick = (e) => {
+      if (btn.dataset.tool === "blend" && e.altKey) { setTool("blend"); openBlendOptions(); return; }
       const slot = TOOL_DEFS.flatMap((c) => c.slots).find((s) => s.id === btn.dataset.slot);
       const r = btn.getBoundingClientRect();
       if (slot?.flyout && e.clientX > r.right - 12 && e.clientY > r.bottom - 12) openFlyout(slot, r);
-      else if (slot?.flyout && ui.tool === btn.dataset.tool) openFlyout(slot, r);
+      else if (slot?.flyout && ui.tool === btn.dataset.tool && btn.dataset.tool !== "blend") openFlyout(slot, r);
       else setTool(btn.dataset.tool);
+    };
+    btn.ondblclick = (e) => {
+      if (btn.dataset.tool !== "blend") return;
+      e.preventDefault();
+      e.stopPropagation();
+      setTool("blend");
+      openBlendOptions();
     };
     btn.oncontextmenu = (e) => {
       e.preventDefault();
@@ -3403,6 +3462,7 @@ function drawTaskbar() {
   el.innerHTML = `
     <i class="grip" id="task-grip" title="Drag"></i>
     ${isText ? `<button class="act" data-cmd="createOutlines">${icon("type", 14)} Create Outlines</button>` : ""}
+    ${selectedBlends().length ? `<button class="act" data-cmd="blendOptions">${icon("blend", 14)} Blend Options</button>` : ""}
     ${isPath && n.length === 1 ? `<button class="act" data-cmd="offsetPath">${icon("rectangle", 14)} Offset Path</button><button class="act" data-cmd="simplify">${icon("curvature", 14)} Simplify</button>` : ""}
     <button class="act" data-cmd="duplicate">${icon("copy", 14)} Duplicate</button>
     <button data-cmd="panel" data-arg="color" title="Fill"><i class="chip ${fillNone ? "none" : ""}" style="background:${fill?.type === "solid" ? rgbCss(fill.color) : ""}"></i></button>
@@ -3761,6 +3821,7 @@ function propertiesHTML(n, nodes) {
   </div>
   <div class="psec"><h3>Quick Actions</h3>
     <div class="qa">
+      ${selectedBlends().length ? `<button class="btn" data-cmd="blendOptions">Blend Options…</button>` : ""}
       <button class="btn" data-cmd="offsetPath">Offset Path</button>
       <button class="btn" data-cmd="simplify">Simplify</button>
       <button class="btn" data-cmd="bringFront">Arrange: Bring to Front</button>
@@ -4063,7 +4124,7 @@ function applyStyle(i) {
 const HINTS = {
   selection: [["Click", 1], [" the object to select  |  ", 0], ["Shift+Click", 1], [" to select multiple objects  |  ", 0], ["Alt+Drag", 1], [" the object to duplicate", 0]],
   directSelection: [["Click", 1], [" an anchor or blend spine  |  ", 0], ["Drag", 1], [" to move  |  ", 0], ["Pen", 1], [" on a spine adds a point", 0]],
-  blend: [["Click", 1], [" two objects  |  ", 0], ["Select the blend", 1], [" to show its spine  |  ", 0], ["Drag a spine point", 1], [" and the steps follow", 0]],
+  blend: [["Click", 1], [" an object, then another to blend them  |  ", 0], ["Alt+Click", 1], [" to set spacing and orientation", 0]],
   pen: [["Click", 1], [" to add a corner point  |  ", 0], ["Drag", 1], [" to add a smooth point  |  ", 0], ["Click the first point", 1], [" to close  |  ", 0], ["Enter", 1], [" to finish", 0]],
   type: [["Click", 1], [" to create point type  |  ", 0], ["Esc", 1], [" to exit editing", 0]],
   areaType: [["Click", 1], [" to create point type  |  ", 0], ["Drag", 1], [" to create area type", 0]],
@@ -4212,6 +4273,30 @@ function openModal(kind) {
     Ctrl+Z undo · Ctrl+S save · Ctrl+E export SVG · Ctrl+0 fit · Ctrl+G group · Del delete<br/>
     Arrows nudge · Shift+arrows nudge 10 · [ ] arrange · Ctrl+K search</p>
     <div class="actions"><button class="btn primary" data-x>Close</button></div>`;
+  else if (kind === "blend") {
+    const targets = selectedBlends();
+    const fields = targets.length ? readBlendOptions(targets[0].kind.spec) : { ...ui.blendDefaults };
+    const valueShown = fields.spacing === "distance" ? "distance" : "steps";
+    inner = `<h2>Blend Options</h2>
+      <p class="hint">${targets.length ? "Preview updates the selected blend. OK keeps it as one undo step." : "These options apply to new blends."}</p>
+      <div class="row"><label style="width:90px;color:var(--text-dim)">Spacing</label>
+        <select class="full" id="bl-spacing">
+          <option value="smooth" ${fields.spacing === "smooth" ? "selected" : ""}>Smooth Color</option>
+          <option value="steps" ${fields.spacing === "steps" ? "selected" : ""}>Specified Steps</option>
+          <option value="distance" ${fields.spacing === "distance" ? "selected" : ""}>Specified Distance</option>
+        </select></div>
+      <div class="grid2">
+        <div data-bl="steps" ${valueShown === "steps" ? "" : "hidden"}>${numField("Steps", fields.steps, "blsteps")}</div>
+        <div data-bl="distance" ${valueShown === "distance" ? "" : "hidden"}>${numField("Distance", fields.distance, "bldist", "pt")}</div>
+      </div>
+      <div class="row"><label style="width:90px;color:var(--text-dim)">Orientation</label>
+        <button type="button" class="btn orient ${fields.orientation === "page" ? "on" : ""}" data-orient="page">Align to Page</button>
+        <button type="button" class="btn orient ${fields.orientation === "path" ? "on" : ""}" data-orient="path">Align to Path</button>
+      </div>
+      ${targets.length ? `<div class="row"><label><input type="checkbox" id="bl-preview" checked/> Preview</label></div>` : ""}
+      <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="bl-ok">OK</button></div>`;
+    back.dataset.blend = "1";
+  }
   else if (kind === "mesh") inner = `<h2>Create Gradient Mesh</h2>
     <div class="grid2">${numField("Rows", 4, "mrows")}${numField("Columns", 4, "mcols")}</div>
     <div class="row"><label style="width:90px;color:var(--text-dim)">Appearance</label>
@@ -4229,6 +4314,54 @@ function openModal(kind) {
   document.body.appendChild(back);
   back.addEventListener("mousedown", (e) => { if (e.target === back) back.remove(); });
   back.querySelectorAll("[data-x]").forEach((b) => b.onclick = () => back.remove());
+  if (kind === "blend") {
+    const targets = selectedBlends();
+    const before = targets.map((b) => JSON.stringify(b.kind.spec || {}));
+    let dirty = false;
+    const restore = () => {
+      if (!dirty) return;
+      targets.forEach((b, i) => { b.kind.spec = JSON.parse(before[i]); });
+      dirty = false;
+      paint();
+    };
+    back.addEventListener("mousedown", (e) => { if (e.target === back) restore(); }, true);
+    back.querySelectorAll("[data-x]").forEach((b) => b.onclick = () => { restore(); back.remove(); });
+    const changed = () => {
+      const steps = back.querySelector("[data-field=blsteps]");
+      if (steps && !steps.disabled) steps.dataset.typed = steps.value;
+      syncBlendForm(back, targets);
+      if (previewBlendOptions(back, targets, () => { dirty = true; })) dirty = true;
+    };
+    back.querySelector("#bl-spacing").onchange = changed;
+    back.querySelectorAll("input").forEach((el) => { el.oninput = changed; });
+    back.querySelector("#bl-preview")?.addEventListener("change", () => {
+      if (back.querySelector("#bl-preview").checked) {
+        if (previewBlendOptions(back, targets, () => { dirty = true; })) dirty = true;
+      } else restore();
+    });
+    back.querySelectorAll(".orient").forEach((btn) => btn.onclick = () => {
+      back.querySelectorAll(".orient").forEach((b) => b.classList.toggle("on", b === btn));
+      if (previewBlendOptions(back, targets, () => { dirty = true; })) dirty = true;
+    });
+    syncBlendForm(back, targets);
+    back.querySelector("#bl-ok").onclick = () => {
+      const fields = blendFieldsFrom(back);
+      if (!targets.length) {
+        ui.blendDefaults = fields;
+        back.remove();
+        toast("New blends use these options");
+        return;
+      }
+      const next = before.map((raw) => writeBlendOptions(JSON.parse(raw), fields));
+      if (next.every((spec, i) => JSON.stringify(spec) === before[i])) { restore(); back.remove(); return; }
+      targets.forEach((b, i) => { b.kind.spec = JSON.parse(before[i]); });
+      pushHistory();
+      targets.forEach((b, i) => { b.kind.spec = next[i]; });
+      back.remove();
+      paint();
+      refreshChrome();
+    };
+  }
   back.querySelector("#nd-ok")?.addEventListener("click", () => {
     const w = +back.querySelector("[data-field=nw]").value || 800;
     const h = +back.querySelector("[data-field=nh]").value || 600;

@@ -410,6 +410,7 @@ select.full:focus, input.full:focus { border-color: var(--accent); }
 .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .btn { height: 26px; padding: 0 12px; border-radius: 4px; background: var(--widget); border: 1px solid var(--border-soft); }
 .btn:hover { background: var(--hover); }
+.btn.on { background: var(--accent); border-color: transparent; color: #fff; }
 .btn.primary { background: var(--accent); border-color: transparent; color: #fff; }
 .btn.primary:hover { filter: brightness(1.06); }
 

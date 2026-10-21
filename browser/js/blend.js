@@ -4,7 +4,7 @@ Without a stored spine the spine is the polyline through the key centres. Once i
 are shifted from that straight interpolation onto the spine by arc length. Align to Path also
 turns them to the spine's direction. */
 
-import { flattenPath, rotateXf } from "./geom.js";
+import { flattenPath, rotateXf, toRgb } from "./geom.js";
 import { nodeBounds, transformNode, translateNode } from "./model.js";
 
 export function centerOf(node) {
@@ -372,6 +372,119 @@ export function removeSpineAnchor(blend, index) {
   for (let k = 0; k < pinned.anchors.length; k++) if (pinned.anchors[k] > index) pinned.anchors[k] -= 1;
   storeSpine(spec, pinned);
   return true;
+}
+
+function spacingMode(spacing) {
+  if (!spacing || spacing === "smoothColor" || spacing === "smooth") return "smooth";
+  if (spacing === "steps" || spacing === "distance") return spacing;
+  if (typeof spacing === "object") {
+    if (spacing.steps != null) return "steps";
+    if (spacing.distance != null) return "distance";
+  }
+  return "smooth";
+}
+
+function topPaint(node, kind) {
+  const items = node?.appearance?.items || [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === kind && it.visible !== false && it.paint) return it.paint;
+  }
+  return null;
+}
+
+function paintColors(paint) {
+  if (!paint || paint.type === "none") return [];
+  if (paint.type === "solid") return paint.color ? [paint.color] : [];
+  if (paint.type === "gradient") return (paint.gradient?.stops || paint.stops || []).map((s) => s.color).filter(Boolean);
+  return [];
+}
+
+/** Largest channel difference (0..1) between the top fill and stroke, as `color_distance`. */
+function colorDistance(a, b) {
+  let d = 0;
+  const cmp = (x, y) => {
+    const cx = paintColors(x);
+    const cy = paintColors(y);
+    for (let i = 0; i < cx.length; i++) {
+      const o = cy[i] || cy[0];
+      if (!o) continue;
+      const p = toRgb(cx[i]);
+      const q = toRgb(o);
+      d = Math.max(d, Math.abs(p.r - q.r), Math.abs(p.g - q.g), Math.abs(p.b - q.b));
+    }
+  };
+  cmp(topPaint(a, "fill"), topPaint(b, "fill"));
+  cmp(topPaint(a, "stroke"), topPaint(b, "stroke"));
+  return d;
+}
+
+function pairLength(keys, spec, i) {
+  if (spec?.spine) {
+    const rail = railOf(keys, spec);
+    if (rail && Number.isFinite(rail.stops[i]) && Number.isFinite(rail.stops[i + 1])) {
+      return Math.max(0, rail.stops[i + 1] - rail.stops[i]);
+    }
+  }
+  const a = centerOf(keys[i]);
+  const b = centerOf(keys[i + 1]);
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+/** Intermediate steps between two keys, matching `blend_step_count`. */
+export function blendStepCount(a, b, spacing, len) {
+  const mode = spacingMode(spacing);
+  if (mode === "steps") {
+    const n = typeof spacing === "object" ? +(spacing.steps ?? spacing.value ?? 1) : 1;
+    return Math.max(1, Math.min(1000, Math.round(n || 1)));
+  }
+  if (mode === "distance") {
+    const raw = typeof spacing === "object" ? +(spacing.distance ?? spacing.value ?? 0.01) : 0.01;
+    const d = Math.max(0.01, raw);
+    return Math.max(0, Math.min(1000, Math.round(len / d) - 1));
+  }
+  const cd = colorDistance(a, b);
+  if (cd > 1 / 255) return Math.max(1, Math.min(256, Math.ceil((cd * 255) / 2)));
+  const ba = nodeBounds(a);
+  const bb = nodeBounds(b);
+  const dist = ba && bb
+    ? Math.max(Math.abs(ba.x0 - bb.x0), Math.abs(ba.x1 - bb.x1), Math.abs(ba.y0 - bb.y0), Math.abs(ba.y1 - bb.y1))
+    : len;
+  return Math.max(1, Math.min(256, Math.ceil(dist / 2)));
+}
+
+/** Steps between key pair `i`, using the spine's arc length when a spine is stored. */
+export function stepsBetween(keys, spec, i) {
+  return blendStepCount(keys[i], keys[i + 1], spec?.spacing, pairLength(keys, spec, i));
+}
+
+/** Dialog fields from a blend spec (`smooth` | `steps` | `distance`, `page` | `path`). */
+export function readBlendOptions(spec) {
+  const spacing = spec?.spacing;
+  let mode = "smooth";
+  let steps = 5;
+  let distance = 10;
+  if (spacing && typeof spacing === "object") {
+    if (spacing.steps != null) { mode = "steps"; steps = spacing.steps; }
+    else if (spacing.distance != null) { mode = "distance"; distance = spacing.distance; }
+  } else if (spacing === "steps") mode = "steps";
+  else if (spacing === "distance") mode = "distance";
+  const orientation = spec?.orientation === "alignToPath" || spec?.orientation === "path" ? "path" : "page";
+  return { spacing: mode, steps, distance, orientation };
+}
+
+/** Write Blend Options onto a spec, using the file's serde names. */
+export function writeBlendOptions(spec, fields) {
+  const mode = fields?.spacing || "smooth";
+  if (mode === "steps") {
+    spec.spacing = { steps: Math.max(1, Math.min(1000, Math.round(+fields.steps || 1))) };
+  } else if (mode === "distance") {
+    spec.spacing = { distance: Math.max(0.01, +fields.distance || 0.01) };
+  } else {
+    spec.spacing = "smoothColor";
+  }
+  spec.orientation = fields?.orientation === "path" || fields?.orientation === "alignToPath" ? "alignToPath" : "alignToPage";
+  return spec;
 }
 
 export function spinePointAt(path, p, tol) {

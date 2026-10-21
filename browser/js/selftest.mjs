@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
 import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
-import { addSpineAnchor, blendSpine, moveSpineAnchor, removeSpineAnchor } from "./blend.js";
+import { addSpineAnchor, blendSpine, moveSpineAnchor, readBlendOptions, removeSpineAnchor, stepsBetween, writeBlendOptions } from "./blend.js";
 import { loadFile } from "./model.js";
 import { ellipsePath, pathD, toRgb, warpDocPoint } from "./geom.js";
 import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
@@ -87,6 +87,46 @@ const followedMid = followed[1].kind.path.subpaths[0].anchors.reduce((s, a) => (
 followedMid.x /= 4; followedMid.y /= 4;
 if (Math.hypot(followedMid.x - 55, followedMid.y + 95) > 1e-4) throw new Error("edited spine mid " + JSON.stringify(followedMid));
 console.log("blend spine", inserted, "mid", followedMid.y.toFixed(2));
+
+function painted(x, color) {
+  const n = rectNode(x);
+  n.appearance = { items: [{ kind: "fill", visible: true, paint: { type: "solid", color } }] };
+  return n;
+}
+const red = painted(0, { model: "rgb", r: 1, g: 0, b: 0 });
+const blue = painted(100, { model: "rgb", r: 0, g: 0, b: 1 });
+if (stepsBetween([red, blue], { spacing: "smoothColor" }, 0) !== 128) throw new Error("smooth color steps");
+if (stepsBetween([rectNode(0), rectNode(100)], { spacing: "smoothColor" }, 0) !== 50) throw new Error("same-color steps");
+if (stepsBetween([rectNode(0), rectNode(100)], { spacing: { distance: 25 } }, 0) !== 3) throw new Error("distance steps");
+if (stepsBetween([rectNode(0), rectNode(100)], { spacing: { steps: 70 } }, 0) !== 70) throw new Error("specified steps");
+const opt = {};
+writeBlendOptions(opt, { spacing: "distance", distance: 12, orientation: "path" });
+if (opt.spacing.distance !== 12 || opt.orientation !== "alignToPath") throw new Error("write blend options " + JSON.stringify(opt));
+const read = readBlendOptions(opt);
+if (read.spacing !== "distance" || read.orientation !== "path" || read.distance !== 12) throw new Error("read blend options " + JSON.stringify(read));
+function stacked(y) {
+  const n = rectNode(0);
+  n.kind.path.subpaths[0].anchors.forEach((a) => { a.p.y += y; a.in.y += y; a.out.y += y; });
+  return n;
+}
+const upright = expandBlend({
+  kind: {
+    type: "blend",
+    spec: {
+      spacing: { steps: 1 },
+      orientation: "alignToPath",
+      keyAnchors: [0, 1],
+      spine: { subpaths: [{ closed: false, anchors: [
+        { p: { x: 5, y: 5 }, in: { x: 5, y: 5 }, out: { x: 5, y: 5 }, kind: "Corner" },
+        { p: { x: 5, y: 105 }, in: { x: 5, y: 105 }, out: { x: 5, y: 105 }, kind: "Corner" },
+      ] }] },
+    },
+    children: [stacked(0), stacked(100)],
+  },
+});
+const turned = upright[1].kind.path.subpaths[0].anchors[0].p;
+if (Math.abs(turned.x - 10) > 1e-3 || Math.abs(turned.y - 50) > 1e-3) throw new Error("align to path " + JSON.stringify(turned));
+console.log("blend options", read.spacing, "turned", turned.x.toFixed(2), turned.y.toFixed(2));
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];
