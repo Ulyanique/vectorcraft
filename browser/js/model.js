@@ -181,7 +181,10 @@ export function nodeBounds(node) {
   if (k.type === "text") return textBounds(k);
   if (k.type === "mesh") {
     let b = null;
-    for (const p of k.points || []) b = include(b, p.p);
+    for (const p of k.points || []) {
+      b = include(b, p.p);
+      for (const h of p.handles || []) b = include(b, { x: p.p.x + (h.x || 0), y: p.p.y + (h.y || 0) });
+    }
     return b;
   }
   const kids = childrenOf(node);

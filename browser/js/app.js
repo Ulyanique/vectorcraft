@@ -13,7 +13,7 @@ import {
 } from "./model.js";
 import { loadFontMetrics } from "./fontmetrics.js";
 import { loadFace, outlineGlyphs } from "./outlines.js";
-import { locateUv, meshFromPath } from "./mesh.js";
+import { addLinesAt, locateUv, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
@@ -188,6 +188,7 @@ function undo() {
   if (!d?.history.length) return;
   d.future.push(snapshot(d.file));
   restore(d.file, d.history.pop());
+  ui.meshFocus = null;
   d.selection = d.selection.filter((id) => indexNodes(d.file).map.has(id));
   layersApi()?.clearThumbs();
   paint();
@@ -198,6 +199,7 @@ function redo() {
   if (!d?.future.length) return;
   d.history.push(snapshot(d.file));
   restore(d.file, d.future.pop());
+  ui.meshFocus = null;
   layersApi()?.clearThumbs();
   paint();
   refreshChrome();
@@ -269,9 +271,17 @@ function applyPaint(which, paint) {
   }
   pushHistory();
   const { map } = indexNodes(f);
+  const focus = ui.meshFocus;
+  const meshEdit = ui.tool === "mesh" || ui.tool === "directSelection";
+  const solidColor = paint?.type === "solid" ? paint.color : null;
   for (const id of doc().selection) {
     const n = map.get(id);
-    if (n) setPaint(n, which, deepClone(paint));
+    if (!n) continue;
+    const pt = meshEdit && which === "fill" && solidColor && focus?.id === id && n.kind?.type === "mesh"
+      ? n.kind.points?.[focus.index]
+      : null;
+    if (pt) pt.color = deepClone(solidColor);
+    else setPaint(n, which, deepClone(paint));
   }
   if (which === "fill") ui.fill = deepClone(paint);
   else ui.stroke = deepClone(paint);
@@ -405,7 +415,7 @@ function paintOverlay() {
   const nudge = gesture.on && gesture.mode === "move" ? { x: gesture.dx || 0, y: gesture.dy || 0 } : { x: 0, y: 0 };
   const b = b0 ? { x0: b0.x0 + nudge.x, y0: b0.y0 + nudge.y, x1: b0.x1 + nudge.x, y1: b0.y1 + nudge.y } : null;
   const perspSel = ui.tool === "perspectiveSelection" && d.selection.some((id) => indexNodes(d.file).map.get(id)?.perspective?.plane);
-  if (b && !perspSel && ui.tool !== "directSelection" && ui.tool !== "groupSelection" && ui.tool !== "artboard") {
+  if (b && !perspSel && ui.tool !== "directSelection" && ui.tool !== "groupSelection" && ui.tool !== "artboard" && ui.tool !== "mesh") {
     const p0 = docToScreen({ x: b.x0, y: b.y0 }), p1 = docToScreen({ x: b.x1, y: b.y1 });
     const x = Math.min(p0.x, p1.x), y = Math.min(p0.y, p1.y);
     const w = Math.abs(p1.x - p0.x), h = Math.abs(p1.y - p0.y);
@@ -420,6 +430,7 @@ function paintOverlay() {
     parts.push(`<line x1="${top.x}" y1="${top.y}" x2="${rot.x}" y2="${rot.y}" stroke="#4f80ff" stroke-width="1"/>`);
     parts.push(`<circle cx="${rot.x}" cy="${rot.y}" r="4" fill="#fff" stroke="#4f80ff"/>`);
   }
+  if (d.selection.length && ui.tool !== "artboard") paintMeshPoints(parts);
   if ((ui.tool === "directSelection" || ui.tool === "anchorPoint" || ui.tool === "deleteAnchor") && d.selection.length) {
     const { map, parent } = indexNodes(d.file);
     for (const id of d.selection) {
@@ -600,12 +611,56 @@ function pathOutline(node, color) {
     if (k.type === "path" && k.path && !k.guide) {
       const d = pathD(k.path);
       if (d) parts.push(`<path d="${d}" fill="none" stroke="${color}" stroke-width="1" vector-effect="non-scaling-stroke"/>`);
+    } else if (k.type === "mesh") {
+      const d = pathD(meshLinesPath(k));
+      if (d) parts.push(`<path d="${d}" fill="none" stroke="${color}" stroke-width="1" vector-effect="non-scaling-stroke"/>`);
     } else if (k.type !== "text") {
       for (const c of childrenOf(n) || []) walk(c);
     }
   };
   walk(node);
   return parts.join("");
+}
+
+function paintMeshPoints(parts) {
+  const d = doc();
+  if (!d) return;
+  const { map, parent } = indexNodes(d.file);
+  const focus = ui.meshFocus;
+  const showHandles = ui.tool === "mesh" || ui.tool === "directSelection";
+  const seen = new Set();
+  const walk = (n, color) => {
+    if (!n || n.visible === false || seen.has(n.id)) return;
+    if (n.kind?.type === "mesh") {
+      seen.add(n.id);
+      const focusedHere = showHandles && focus?.id === n.id;
+      for (let i = 0; i < (n.kind.points || []).length; i++) {
+        const q = n.kind.points[i];
+        if (!q?.p) continue;
+        const focused = focusedHere && focus.index === i;
+        const s = docToScreen(q.p);
+        const col = focused ? "#4f9dff" : color;
+        if (focused) {
+          for (const h of q.handles || []) {
+            if (Math.hypot(h.x || 0, h.y || 0) <= 1e-6) continue;
+            const hs = docToScreen({ x: q.p.x + h.x, y: q.p.y + h.y });
+            parts.push(`<line x1="${s.x}" y1="${s.y}" x2="${hs.x}" y2="${hs.y}" stroke="#4f9dff" stroke-width="1"/>`);
+            parts.push(`<circle cx="${hs.x}" cy="${hs.y}" r="3" fill="#fff" stroke="#4f9dff"/>`);
+          }
+        }
+        parts.push(`<rect x="${s.x - 2.5}" y="${s.y - 2.5}" width="5" height="5" fill="${focused ? col : "#fff"}" stroke="${col}"/>`);
+      }
+      return;
+    }
+    for (const c of childrenOf(n) || []) walk(c, color);
+  };
+  for (const id of d.selection) {
+    const n = map.get(id);
+    if (!n) continue;
+    let layer = n;
+    while (layer && layer.kind?.type !== "layer") layer = parent.get(layer.id);
+    walk(n, layer ? layerColorCss(layer) : "#4f80ff");
+  }
 }
 
 function samePt(a, b) { return Math.abs(a.x - b.x) < 1e-3 && Math.abs(a.y - b.y) < 1e-3; }
@@ -1360,15 +1415,102 @@ function createMeshes(opts) {
   refreshChrome();
 }
 
-function meshClick(p) {
+function meshHitOrder() {
+  const d = doc();
+  if (!d) return [];
+  const all = [];
+  for (const n of indexNodes(d.file).map.values()) {
+    if (n.kind?.type === "mesh" && n.visible !== false && !n.locked) all.push(n.id);
+  }
+  const selected = d.selection.filter((id) => all.includes(id));
+  return [...selected, ...all.filter((id) => !selected.includes(id)).reverse()];
+}
+
+function meshGrab(p, ids) {
+  const d = doc();
+  if (!d || !ids?.length) return null;
+  const { map } = indexNodes(d.file);
+  const tol = 5 / (d.zoom || 1);
+  const focus = ui.meshFocus;
+  if (focus && ids.includes(focus.id)) {
+    const n = map.get(focus.id);
+    const pt = n?.kind?.type === "mesh" ? n.kind.points?.[focus.index] : null;
+    if (pt) {
+      for (let h = 0; h < 4; h++) {
+        const off = pt.handles?.[h];
+        if (!off || Math.hypot(off.x, off.y) <= 1e-6) continue;
+        if (Math.hypot(pt.p.x + off.x - p.x, pt.p.y + off.y - p.y) <= tol) {
+          return { id: focus.id, index: focus.index, handle: h, node: n };
+        }
+      }
+    }
+  }
+  for (const id of ids) {
+    const n = map.get(id);
+    if (n?.kind?.type !== "mesh") continue;
+    const index = pointNear(n.kind, p, tol);
+    if (index != null) return { id, index, handle: null, node: n };
+  }
+  return null;
+}
+
+function beginMeshDrag(g) {
+  ui.meshFocus = { id: g.id, index: g.index };
+  if (doc().selection.length !== 1 || doc().selection[0] !== g.id) doc().selection = [g.id];
+  gesture.mode = "meshPoint";
+  gesture.mesh = g;
+  gesture.moved = false;
+  paintOverlay();
+  refreshChrome();
+}
+
+function meshClick(p, e) {
+  const g = meshGrab(p, meshHitOrder());
+  if (g) {
+    if (e?.altKey && g.handle == null) {
+      ui.meshFocus = null;
+      doc().selection = [g.id];
+      const kind = structuredClone(g.node.kind);
+      if (!removePointLines(kind, g.index)) {
+        toast("Only interior mesh lines can be deleted");
+        gesture.on = false;
+        paintOverlay();
+        refreshChrome();
+        return;
+      }
+      pushHistory();
+      g.node.kind = kind;
+      doc().selection = [g.id];
+      gesture.on = false;
+      paint();
+      refreshChrome();
+      return;
+    }
+    beginMeshDrag(g);
+    return;
+  }
+  ui.meshFocus = null;
+  gesture.on = false;
   const hit = hitAt(p, true);
-  if (!hit) { toast("Click a filled path"); gesture.on = false; return; }
+  if (!hit) { toast("Click a filled path"); return; }
   const { parent } = indexNodes(file());
   const par = parent.get(hit.id);
   const node = par?.kind?.type === "compound" ? par : hit;
+  if (node.kind?.type === "mesh") {
+    const kind = structuredClone(node.kind);
+    const index = addLinesAt(kind, p);
+    if (index == null) { toast("Click inside the mesh"); return; }
+    if (!e?.shiftKey && ui.fill?.type === "solid" && ui.fill.color) kind.points[index].color = deepClone(ui.fill.color);
+    pushHistory();
+    node.kind = kind;
+    doc().selection = [node.id];
+    ui.meshFocus = { id: node.id, index };
+    paint();
+    refreshChrome();
+    return;
+  }
   if (node.kind?.type !== "path" && node.kind?.type !== "compound") {
     toast("Click a filled path");
-    gesture.on = false;
     return;
   }
   const path = pathDataOf(node);
@@ -1377,11 +1519,9 @@ function meshClick(p) {
   if (!turnIntoMesh(node, { rows: 1, cols: 1, appearance: "flat", highlight: 100, at })) {
     doc().history.pop();
     toast("Could not build a mesh from that path");
-    gesture.on = false;
     return;
   }
   doc().selection = [node.id];
-  gesture.on = false;
   paint();
   refreshChrome();
 }
@@ -1542,6 +1682,7 @@ function setTool(id) {
   }
   ui.pen = null;
   ui.blendPick = null;
+  ui.meshFocus = null;
   if ((id === "perspectiveGrid" || id === "perspectiveSelection") && file()) {
     const f = file();
     f.document.unknown = f.document.unknown || {};
@@ -1553,7 +1694,7 @@ function setTool(id) {
   if (id === "hand" || ui.space) c.classList.add("hand");
   else if (id === "zoom") c.classList.add("zoom");
   else if (id === "type" || id === "areaType") c.classList.add("text");
-  else if (["pen", "pencil", "paintbrush", "curvature", "addAnchor", "eraser", "lasso"].includes(id) || id.includes("ectangle") || ["ellipse", "polygon", "star", "lineSegment", "roundedRectangle"].includes(id)) c.classList.add("cross");
+  else if (["pen", "pencil", "paintbrush", "curvature", "addAnchor", "eraser", "lasso", "mesh"].includes(id) || id.includes("ectangle") || ["ellipse", "polygon", "star", "lineSegment", "roundedRectangle"].includes(id)) c.classList.add("cross");
   drawToolbar();
   paintOverlay();
   drawHint();
@@ -1716,6 +1857,18 @@ function onDown(e) {
   }
 
   if (tool === "directSelection" || tool === "groupSelection") {
+    if (tool === "directSelection") {
+      const g = meshGrab(p, d.selection);
+      if (g) {
+        ui.meshFocus = { id: g.id, index: g.index };
+        gesture.mode = "meshPoint";
+        gesture.mesh = g;
+        gesture.moved = false;
+        paintOverlay();
+        return;
+      }
+      ui.meshFocus = null;
+    }
     const a = anchorAt(p);
     if (a && tool === "directSelection") {
       d.selection = [a.node.id];
@@ -1778,7 +1931,7 @@ function onDown(e) {
   if (tool === "smooth") { gesture.mode = "smooth"; return; }
   if (tool === "width") { gesture.mode = "width"; return; }
   if (tool === "gradient") { gesture.mode = "gradient"; return; }
-  if (tool === "mesh") { meshClick(p); return; }
+  if (tool === "mesh") { meshClick(p, e); return; }
 }
 
 function onMove(e) {
@@ -1909,6 +2062,28 @@ function onMove(e) {
     paintOverlay();
     return;
   }
+  if (gesture.mode === "meshPoint") {
+    const g = gesture.mesh;
+    const n = indexNodes(d.file).map.get(g?.id);
+    if (n?.kind?.type !== "mesh") return;
+    if (!gesture.moved) {
+      if (Math.hypot(p.x - gesture.start.x, p.y - gesture.start.y) < 0.4) {
+        paintOverlay();
+        return;
+      }
+      pushHistory();
+      gesture.moved = true;
+    }
+    moveMeshPoint(n.kind, g.index, p.x, p.y, g.handle);
+    paintOverlay();
+    if (!gesture.frame) {
+      gesture.frame = requestAnimationFrame(() => {
+        gesture.frame = 0;
+        if (gesture.on && gesture.mode === "meshPoint") paint();
+      });
+    }
+    return;
+  }
   if (gesture.mode === "anchor") {
     if (!gesture.moved) { pushHistory(); gesture.moved = true; }
     const a = gesture.anchor;
@@ -2027,7 +2202,7 @@ function onUp(e) {
     paint(); refreshChrome();
     return;
   }
-  if (mode === "anchor") {
+  if (mode === "meshPoint" || mode === "anchor") {
     gesture.moved = false;
     paint(); refreshChrome();
     return;
@@ -3703,7 +3878,7 @@ const HINTS = {
   artboard: [["Click", 1], [" an artboard to edit it  |  ", 0], ["Drag", 1], [" to move it", 0]],
   perspectiveSelection: [["Drag", 1], [" to move in perspective  |  ", 0], ["Alt+Drag", 1], [" to copy  |  ", 0], ["Drag a handle", 1], [" to scale in perspective", 0]],
   perspectiveGrid: [["Drag", 1], [" a handle to reshape the grid  |  ", 0], ["1–4", 1], [" pick a plane", 0]],
-  mesh: [["Click", 1], [" a filled path to make a gradient mesh  |  ", 0], ["Object", 1], [" › Create Gradient Mesh… sets the rows", 0]],
+  mesh: [["Click", 1], [" a filled path to make a mesh  |  ", 0], ["Click inside", 1], [" to add lines  |  ", 0], ["Shift", 1], [" keeps the blend  |  ", 0], ["Drag", 1], [" a point or its handles  |  ", 0], ["Alt+Click", 1], [" deletes interior lines", 0]],
 };
 function drawHint() {
   const segs = HINTS[ui.tool] || HINTS[ui.tool === "ellipse" || ui.tool === "polygon" || ui.tool === "star" || ui.tool === "roundedRectangle" ? "rectangle" : ""] || [["Search", 1], [" commands and tools for this tool", 0]];

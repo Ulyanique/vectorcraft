@@ -2,8 +2,8 @@ import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
 import { renderDocument, repeatTransforms } from "./render.js";
 import { loadFile } from "./model.js";
-import { ellipsePath, toRgb, warpDocPoint } from "./geom.js";
-import { meshFromPath } from "./mesh.js";
+import { ellipsePath, pathD, toRgb, warpDocPoint } from "./geom.js";
+import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
 import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
 
 const gray = toRgb({ model: "gray", k: 0.9 });
@@ -27,6 +27,28 @@ const disk = meshFromPath(ellipsePath(50, 50, 40, 40), { rows: 2, cols: 2, appea
 const hub = disk.points[1 * 3 + 1].p;
 if (Math.hypot(hub.x - 50, hub.y - 50) > 2) throw new Error("circle mesh centre " + JSON.stringify(hub));
 console.log("mesh", mesh.points.length, "circle hub", hub.x.toFixed(2), hub.y.toFixed(2));
+
+const meshGrid = meshFromPath(rect, { rows: 1, cols: 1, appearance: "flat", color: { model: "rgb", r: 0, g: 0, b: 1 } });
+const rightHandle = meshGrid.points[1].handles[0].x;
+moveMeshPoint(meshGrid, 1, 130, -20);
+if (meshGrid.points[1].p.x !== 130 || meshGrid.points[1].p.y !== -20) throw new Error("mesh point did not move");
+if (Math.abs(meshGrid.points[1].handles[0].x - rightHandle) > 1e-6) throw new Error("moving a point should keep handle offsets");
+moveMeshPoint(meshGrid, 1, 150, -20, 2);
+if (Math.abs(meshGrid.points[1].p.x - 130) > 1e-6) throw new Error("handle drag moved the point");
+if (Math.abs(meshGrid.points[1].handles[2].x - 20) > 1e-6 || Math.abs(meshGrid.points[1].handles[2].y) > 1e-6) throw new Error("handle offset " + JSON.stringify(meshGrid.points[1].handles[2]));
+const editable = meshFromPath(rect, { rows: 1, cols: 1, appearance: "flat" });
+if (pointNear(editable, { x: 0, y: 0 }, 1) !== 0) throw new Error("pointNear missed the corner");
+if (locateMesh(editable, { x: -10, y: 50 }) != null) throw new Error("locateMesh should reject a point outside the outline");
+const added = addLinesAt(editable, { x: 50, y: 50 });
+if (editable.rows !== 2 || editable.cols !== 2 || editable.points.length !== 9) throw new Error("addLinesAt grid " + editable.rows + "x" + editable.cols);
+const hub2 = editable.points[added];
+if (Math.hypot(hub2.p.x - 50, hub2.p.y - 50) > 1) throw new Error("added mesh point " + JSON.stringify(hub2.p));
+const lines = pathD(meshLinesPath(editable));
+if ((lines.match(/[MC]/g) || []).length < 12) throw new Error("mesh lines missing: " + lines.slice(0, 80));
+if (!removePointLines(editable, added)) throw new Error("interior point should delete its lines");
+if (editable.rows !== 1 || editable.cols !== 1 || editable.points.length !== 4) throw new Error("deletePoint left " + editable.points.length);
+if (removePointLines(editable, 0)) throw new Error("a corner point has no interior line to delete");
+console.log("mesh edit", added, "lines", lines.length);
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];
