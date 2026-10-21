@@ -14,6 +14,9 @@ import {
 import { loadFontMetrics } from "./fontmetrics.js";
 import { loadFace, outlineGlyphs } from "./outlines.js";
 import { addLinesAt, locateUv, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
+import {
+  addSpineAnchor, bendSpineSegment, blendSpine, moveSpineAnchor, nearestOnSubpath, removeSpineAnchor, spinePointAt,
+} from "./blend.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
@@ -189,6 +192,7 @@ function undo() {
   d.future.push(snapshot(d.file));
   restore(d.file, d.history.pop());
   ui.meshFocus = null;
+  ui.spineFocus = null;
   d.selection = d.selection.filter((id) => indexNodes(d.file).map.has(id));
   layersApi()?.clearThumbs();
   paint();
@@ -200,6 +204,7 @@ function redo() {
   d.history.push(snapshot(d.file));
   restore(d.file, d.future.pop());
   ui.meshFocus = null;
+  ui.spineFocus = null;
   layersApi()?.clearThumbs();
   paint();
   refreshChrome();
@@ -430,7 +435,10 @@ function paintOverlay() {
     parts.push(`<line x1="${top.x}" y1="${top.y}" x2="${rot.x}" y2="${rot.y}" stroke="#4f80ff" stroke-width="1"/>`);
     parts.push(`<circle cx="${rot.x}" cy="${rot.y}" r="4" fill="#fff" stroke="#4f80ff"/>`);
   }
-  if (d.selection.length && ui.tool !== "artboard") paintMeshPoints(parts);
+  if (d.selection.length && ui.tool !== "artboard") {
+    paintMeshPoints(parts);
+    paintBlendSpines(parts);
+  }
   if ((ui.tool === "directSelection" || ui.tool === "anchorPoint" || ui.tool === "deleteAnchor") && d.selection.length) {
     const { map, parent } = indexNodes(d.file);
     for (const id of d.selection) {
@@ -661,6 +669,105 @@ function paintMeshPoints(parts) {
     while (layer && layer.kind?.type !== "layer") layer = parent.get(layer.id);
     walk(n, layer ? layerColorCss(layer) : "#4f80ff");
   }
+}
+
+function selectedBlends() {
+  const d = doc();
+  if (!d) return [];
+  const { map, parent } = indexNodes(d.file);
+  const out = [];
+  const seen = new Set();
+  for (const id of d.selection) {
+    const n = map.get(id);
+    const blend = n?.kind?.type === "blend" ? n : parent.get(id)?.kind?.type === "blend" ? parent.get(id) : null;
+    if (blend && !seen.has(blend.id)) { seen.add(blend.id); out.push(blend); }
+  }
+  return out;
+}
+
+function allBlends() {
+  const d = doc();
+  if (!d) return [];
+  const out = [];
+  for (const n of indexNodes(d.file).map.values()) if (n.kind?.type === "blend" && n.visible !== false && !n.locked) out.push(n);
+  return out.reverse();
+}
+
+function paintBlendSpines(parts) {
+  const d = doc();
+  if (!d) return;
+  const { parent } = indexNodes(d.file);
+  const focus = ui.spineFocus;
+  const showHandles = ui.tool === "directSelection";
+  for (const blend of selectedBlends()) {
+    const live = blendSpine(blend.kind.children || [], blend.kind.spec);
+    if (!live) continue;
+    let layer = blend;
+    while (layer && layer.kind?.type !== "layer") layer = parent.get(layer.id);
+    const color = layer ? layerColorCss(layer) : "#4f80ff";
+    const dAttr = pathD(live.path);
+    if (dAttr) parts.push(`<g transform="${viewTransform()}"><path d="${dAttr}" fill="none" stroke="${color}" stroke-width="1" vector-effect="non-scaling-stroke"/></g>`);
+    const anchors = live.path.subpaths?.[0]?.anchors || [];
+    anchors.forEach((a, i) => {
+      const focused = showHandles && focus?.id === blend.id && focus.anchor === i;
+      const s = docToScreen(a.p);
+      if (focused) {
+        for (const h of [a.in, a.out]) {
+          if (!h || Math.hypot(h.x - a.p.x, h.y - a.p.y) <= 1e-6) continue;
+          const hs = docToScreen(h);
+          parts.push(`<line x1="${s.x}" y1="${s.y}" x2="${hs.x}" y2="${hs.y}" stroke="${color}" stroke-width="1"/>`);
+          parts.push(`<circle cx="${hs.x}" cy="${hs.y}" r="3" fill="#fff" stroke="${color}"/>`);
+        }
+      }
+      parts.push(`<rect x="${s.x - 2.5}" y="${s.y - 2.5}" width="5" height="5" fill="${focused ? color : "#fff"}" stroke="${color}"/>`);
+    });
+  }
+}
+
+function spineGrab(p, blends) {
+  const d = doc();
+  if (!d) return null;
+  const tol = 5 / (d.zoom || 1);
+  const focus = ui.spineFocus;
+  if (focus && d.selection.includes(focus.id) && blends.some((b) => b.id === focus.id)) {
+    const blend = blends.find((b) => b.id === focus.id);
+    const live = blendSpine(blend.kind.children || [], blend.kind.spec);
+    const a = live?.path.subpaths?.[0]?.anchors?.[focus.anchor];
+    if (a) {
+      if (Math.hypot(a.out.x - a.p.x, a.out.y - a.p.y) > 1e-6 && Math.hypot(a.out.x - p.x, a.out.y - p.y) <= tol) {
+        return { id: blend.id, blend, anchor: focus.anchor, handle: "out" };
+      }
+      if (Math.hypot(a.in.x - a.p.x, a.in.y - a.p.y) > 1e-6 && Math.hypot(a.in.x - p.x, a.in.y - p.y) <= tol) {
+        return { id: blend.id, blend, anchor: focus.anchor, handle: "in" };
+      }
+    }
+  }
+  for (const blend of blends) {
+    const live = blendSpine(blend.kind.children || [], blend.kind.spec);
+    const index = live ? spinePointAt(live.path, p, tol) : null;
+    if (index != null) return { id: blend.id, blend, anchor: index, handle: null, keys: live.anchors };
+  }
+  return null;
+}
+
+function spineSegmentGrab(p) {
+  const d = doc();
+  if (!d) return null;
+  const tol = 5 / (d.zoom || 1);
+  for (const blend of selectedBlends()) {
+    if (!doc().selection.includes(blend.id)) continue;
+    const live = blendSpine(blend.kind.children || [], blend.kind.spec);
+    const sp = live?.path.subpaths?.[0];
+    if (!sp) continue;
+    const near = nearestOnSubpath(sp, p);
+    if (!near || near.dist > tol) continue;
+    const a = sp.anchors[near.seg];
+    const b = sp.anchors[(near.seg + 1) % sp.anchors.length];
+    const line = Math.hypot(a.out.x - a.p.x, a.out.y - a.p.y) <= 1e-6 && Math.hypot(b.in.x - b.p.x, b.in.y - b.p.y) <= 1e-6;
+    if (line) continue;
+    return { id: blend.id, blend, seg: near.seg, t: near.t };
+  }
+  return null;
 }
 
 function samePt(a, b) { return Math.abs(a.x - b.x) < 1e-3 && Math.abs(a.y - b.y) < 1e-3; }
@@ -1683,6 +1790,7 @@ function setTool(id) {
   ui.pen = null;
   ui.blendPick = null;
   ui.meshFocus = null;
+  ui.spineFocus = null;
   if ((id === "perspectiveGrid" || id === "perspectiveSelection") && file()) {
     const f = file();
     f.document.unknown = f.document.unknown || {};
@@ -1848,6 +1956,15 @@ function onDown(e) {
       paintOverlay();
       return;
     }
+    const spine = spineGrab(p, selectedBlends());
+    if (spine) {
+      if (!d.selection.includes(spine.id)) d.selection = [spine.id];
+      gesture.mode = "move";
+      gesture.ids = collectTop(d.file, d.selection);
+      refreshChrome();
+      paintOverlay();
+      return;
+    }
     d.selection = [];
     gesture.mode = "marquee";
     gesture.marquee = { a: screen, b: screen };
@@ -1868,6 +1985,17 @@ function onDown(e) {
         return;
       }
       ui.meshFocus = null;
+      const spine = spineGrab(p, allBlends());
+      if (spine) {
+        ui.spineFocus = { id: spine.id, anchor: spine.anchor };
+        if (!d.selection.includes(spine.id)) d.selection = [spine.id];
+        gesture.mode = spine.handle ? "spineHandle" : "spinePoint";
+        gesture.spine = spine;
+        gesture.moved = false;
+        paintOverlay();
+        refreshChrome();
+        return;
+      }
     }
     const a = anchorAt(p);
     if (a && tool === "directSelection") {
@@ -1877,6 +2005,18 @@ function onDown(e) {
       gesture.originPt = { ...a.node.kind.path.subpaths[a.si].anchors[a.ai][a.which] };
       paintOverlay();
       return;
+    }
+    if (tool === "directSelection") {
+      const seg = spineSegmentGrab(p);
+      if (seg) {
+        ui.spineFocus = null;
+        gesture.mode = "spineSegment";
+        gesture.spine = seg;
+        gesture.kind0 = structuredClone(seg.blend.kind);
+        gesture.moved = false;
+        paintOverlay();
+        return;
+      }
     }
     const hit = hitAt(p, true);
     if (hit) {
@@ -2062,6 +2202,33 @@ function onMove(e) {
     paintOverlay();
     return;
   }
+  if (gesture.mode === "spinePoint" || gesture.mode === "spineHandle" || gesture.mode === "spineSegment") {
+    const g = gesture.spine;
+    const n = indexNodes(d.file).map.get(g?.id);
+    if (n?.kind?.type !== "blend") return;
+    if (!gesture.moved) {
+      if (Math.hypot(p.x - gesture.start.x, p.y - gesture.start.y) < 0.4) {
+        paintOverlay();
+        return;
+      }
+      pushHistory();
+      gesture.moved = true;
+    }
+    if (gesture.mode === "spineSegment") {
+      n.kind = structuredClone(gesture.kind0);
+      bendSpineSegment(n, g.seg, g.t, p.x - gesture.start.x, p.y - gesture.start.y);
+    } else {
+      moveSpineAnchor(n, g.anchor, p.x, p.y, g.handle, e.altKey);
+    }
+    paintOverlay();
+    if (!gesture.frame) {
+      gesture.frame = requestAnimationFrame(() => {
+        gesture.frame = 0;
+        if (gesture.on && (gesture.mode === "spinePoint" || gesture.mode === "spineHandle" || gesture.mode === "spineSegment")) paint();
+      });
+    }
+    return;
+  }
   if (gesture.mode === "meshPoint") {
     const g = gesture.mesh;
     const n = indexNodes(d.file).map.get(g?.id);
@@ -2202,7 +2369,7 @@ function onUp(e) {
     paint(); refreshChrome();
     return;
   }
-  if (mode === "meshPoint" || mode === "anchor") {
+  if (mode === "meshPoint" || mode === "anchor" || mode === "spinePoint" || mode === "spineHandle" || mode === "spineSegment") {
     gesture.moved = false;
     paint(); refreshChrome();
     return;
@@ -2517,6 +2684,36 @@ function eraseAlong(pts) {
 
 function penClick(p, e) {
   const d = doc();
+  if (!ui.pen?.anchors?.length) {
+    const tol = 6 / (d.zoom || 1);
+    for (const blend of selectedBlends()) {
+      if (!d.selection.includes(blend.id)) continue;
+      const live = blendSpine(blend.kind.children || [], blend.kind.spec);
+      const sp = live?.path.subpaths?.[0];
+      if (!sp) continue;
+      const onPoint = spinePointAt(live.path, p, tol);
+      if (onPoint != null) {
+        if ((live.anchors || []).includes(onPoint)) { gesture.on = false; return; }
+        pushHistory();
+        removeSpineAnchor(blend, onPoint);
+        ui.spineFocus = null;
+        gesture.on = false;
+        paint();
+        refreshChrome();
+        return;
+      }
+      const near = nearestOnSubpath(sp, p);
+      if (near && near.dist <= tol) {
+        pushHistory();
+        const index = addSpineAnchor(blend, near.p.x, near.p.y);
+        if (index != null) ui.spineFocus = { id: blend.id, anchor: index };
+        gesture.on = false;
+        paint();
+        refreshChrome();
+        return;
+      }
+    }
+  }
   if (!ui.pen) ui.pen = { anchors: [] };
   const anchors = ui.pen.anchors;
   if (anchors.length >= 3 && dist(p, anchors[0].p) < 8 / d.zoom) {
@@ -3865,7 +4062,8 @@ function applyStyle(i) {
 
 const HINTS = {
   selection: [["Click", 1], [" the object to select  |  ", 0], ["Shift+Click", 1], [" to select multiple objects  |  ", 0], ["Alt+Drag", 1], [" the object to duplicate", 0]],
-  directSelection: [["Click", 1], [" an anchor or path segment to select it  |  ", 0], ["Drag", 1], [" to move  |  ", 0], ["Shift+Click", 1], [" to add", 0]],
+  directSelection: [["Click", 1], [" an anchor or blend spine  |  ", 0], ["Drag", 1], [" to move  |  ", 0], ["Pen", 1], [" on a spine adds a point", 0]],
+  blend: [["Click", 1], [" two objects  |  ", 0], ["Select the blend", 1], [" to show its spine  |  ", 0], ["Drag a spine point", 1], [" and the steps follow", 0]],
   pen: [["Click", 1], [" to add a corner point  |  ", 0], ["Drag", 1], [" to add a smooth point  |  ", 0], ["Click the first point", 1], [" to close  |  ", 0], ["Enter", 1], [" to finish", 0]],
   type: [["Click", 1], [" to create point type  |  ", 0], ["Esc", 1], [" to exit editing", 0]],
   areaType: [["Click", 1], [" to create point type  |  ", 0], ["Drag", 1], [" to create area type", 0]],

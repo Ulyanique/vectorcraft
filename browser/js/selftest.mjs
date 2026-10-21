@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { polygonBoolean } from "./bool.js";
-import { renderDocument, repeatTransforms } from "./render.js";
+import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
+import { addSpineAnchor, blendSpine, moveSpineAnchor, removeSpineAnchor } from "./blend.js";
 import { loadFile } from "./model.js";
 import { ellipsePath, pathD, toRgb, warpDocPoint } from "./geom.js";
 import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
@@ -49,6 +50,43 @@ if (!removePointLines(editable, added)) throw new Error("interior point should d
 if (editable.rows !== 1 || editable.cols !== 1 || editable.points.length !== 4) throw new Error("deletePoint left " + editable.points.length);
 if (removePointLines(editable, 0)) throw new Error("a corner point has no interior line to delete");
 console.log("mesh edit", added, "lines", lines.length);
+
+function rectNode(x) {
+  const corner = (px, py) => ({ p: { x: px, y: py }, in: { x: px, y: py }, out: { x: px, y: py }, kind: "Corner" });
+  return {
+    id: x + 1, visible: true, opacity: 1, appearance: { items: [] },
+    kind: { type: "path", path: { subpaths: [{ closed: true, anchors: [corner(x, 0), corner(x + 10, 0), corner(x + 10, 10), corner(x, 10)] }] } },
+  };
+}
+const keys = [rectNode(0), rectNode(100)];
+const straight = expandBlend({ kind: { type: "blend", spec: { spacing: { steps: 1 } }, children: keys } });
+const straightMid = straight[1].kind.path.subpaths[0].anchors.reduce((s, a) => ({ x: s.x + a.p.x, y: s.y + a.p.y }), { x: 0, y: 0 });
+straightMid.x /= 4; straightMid.y /= 4;
+if (Math.hypot(straightMid.x - 55, straightMid.y - 5) > 1e-6) throw new Error("straight blend mid " + JSON.stringify(straightMid));
+const spine = { subpaths: [{ closed: false, anchors: [
+  { p: { x: 5, y: 5 }, in: { x: 5, y: 5 }, out: { x: 5, y: 5 }, kind: "Corner" },
+  { p: { x: 55, y: -95 }, in: { x: 55, y: -95 }, out: { x: 55, y: -95 }, kind: "Corner" },
+  { p: { x: 105, y: 5 }, in: { x: 105, y: 5 }, out: { x: 105, y: 5 }, kind: "Corner" },
+] }] };
+const bent = expandBlend({ kind: { type: "blend", spec: { spacing: { steps: 1 }, spine, keyAnchors: [0, 2] }, children: keys } });
+const bentMid = bent[1].kind.path.subpaths[0].anchors.reduce((s, a) => ({ x: s.x + a.p.x, y: s.y + a.p.y }), { x: 0, y: 0 });
+bentMid.x /= 4; bentMid.y /= 4;
+if (Math.hypot(bentMid.x - 55, bentMid.y + 95) > 1e-4) throw new Error("bent spine mid " + JSON.stringify(bentMid));
+if (Math.hypot(bent[0].kind.path.subpaths[0].anchors[0].p.x - 0, bent[0].kind.path.subpaths[0].anchors[0].p.y) > 1e-6) throw new Error("key moved with the spine");
+const live = blendSpine(keys, {});
+if (live.anchors.join() !== "0,1" || Math.hypot(live.path.subpaths[0].anchors[0].p.x - 5, live.path.subpaths[0].anchors[0].p.y - 5) > 1e-6) {
+  throw new Error("default spine " + JSON.stringify(live.path.subpaths[0].anchors.map((a) => a.p)));
+}
+const spineBlend = { kind: { type: "blend", spec: { spacing: { steps: 1 } }, children: [rectNode(0), rectNode(100)] } };
+const inserted = addSpineAnchor(spineBlend, 55, 5);
+if (inserted !== 1 || spineBlend.kind.spec.keyAnchors.join() !== "0,2") throw new Error("add spine point " + inserted + " " + spineBlend.kind.spec.keyAnchors);
+if (!moveSpineAnchor(spineBlend, 1, 55, -95)) throw new Error("move spine point");
+if (removeSpineAnchor(spineBlend, 0)) throw new Error("a key's spine point should stay");
+const followed = expandBlend(spineBlend);
+const followedMid = followed[1].kind.path.subpaths[0].anchors.reduce((s, a) => ({ x: s.x + a.p.x, y: s.y + a.p.y }), { x: 0, y: 0 });
+followedMid.x /= 4; followedMid.y /= 4;
+if (Math.hypot(followedMid.x - 55, followedMid.y + 95) > 1e-4) throw new Error("edited spine mid " + JSON.stringify(followedMid));
+console.log("blend spine", inserted, "mid", followedMid.y.toFixed(2));
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];

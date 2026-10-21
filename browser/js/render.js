@@ -6,6 +6,7 @@ import {
 } from "./geom.js";
 import { childrenOf, nodeBounds } from "./model.js";
 import { cachedFace, outlineGlyphs } from "./outlines.js";
+import { placeStep, spineActive } from "./blend.js";
 
 let gid = 1;
 function nextId(prefix) { return `${prefix}${gid++}`; }
@@ -233,22 +234,33 @@ function fontWeight(style) {
   return 400;
 }
 
+function placedKey(node, keys, spec, i) {
+  if (!spineActive(spec)) return node;
+  const copy = JSON.parse(JSON.stringify(node));
+  placeStep(copy, keys, spec, i, 0);
+  return copy;
+}
+
 function renderBlend(node, k, ctx) {
   const keys = k.children || [];
   if (keys.length < 2) return keys.map((c) => renderNode(c, ctx)).join("");
   const steps = k.spec?.spacing?.steps ?? 20;
+  const spec = k.spec;
   const parts = [];
   for (let i = 0; i < keys.length - 1; i++) {
     const a = keys[i], b = keys[i + 1];
-    parts.push(renderNode(a, { ...ctx, opacity: (a.opacity ?? 1) }));
+    parts.push(renderNode(placedKey(a, keys, spec, i), { ...ctx, opacity: (a.opacity ?? 1) }));
     const n = Math.max(1, Math.min(240, steps));
     for (let j = 1; j <= n; j++) {
       const t = j / (n + 1);
       const mid = lerpNode(a, b, t);
-      if (mid) parts.push(renderNode(mid, ctx));
+      if (!mid) continue;
+      placeStep(mid, keys, spec, i, t);
+      parts.push(renderNode(mid, ctx));
     }
   }
-  parts.push(renderNode(keys[keys.length - 1], ctx));
+  const last = keys.length - 1;
+  parts.push(renderNode(placedKey(keys[last], keys, spec, last), ctx));
   return `<g data-id="${node.id}">${parts.join("")}</g>`;
 }
 
@@ -562,29 +574,41 @@ function round(v) { return Math.round(v * 1000) / 1000; }
 export function expandBlend(node) {
   const keys = node.kind?.children || [];
   if (keys.length < 2) return keys.map((k) => JSON.parse(JSON.stringify(k)));
-  const steps = Math.max(1, Math.min(240, node.kind.spec?.spacing?.steps ?? 12));
+  const spec = node.kind.spec;
+  const steps = Math.max(1, Math.min(240, spec?.spacing?.steps ?? 12));
   const out = [];
   for (let i = 0; i < keys.length - 1; i++) {
-    out.push(JSON.parse(JSON.stringify(keys[i])));
+    out.push(placedKey(keys[i], keys, spec, i));
     for (let j = 1; j <= steps; j++) {
-      const mid = lerpNode(keys[i], keys[i + 1], j / (steps + 1));
-      if (mid) out.push(mid);
+      const t = j / (steps + 1);
+      const mid = lerpNode(keys[i], keys[i + 1], t);
+      if (!mid) continue;
+      placeStep(mid, keys, spec, i, t);
+      out.push(mid);
     }
   }
-  out.push(JSON.parse(JSON.stringify(keys[keys.length - 1])));
+  const last = keys.length - 1;
+  out.push(placedKey(keys[last], keys, spec, last));
   return out;
 }
 
 export function blendHit(node, p, tol = 6) {
   const keys = node.kind?.children || [];
   if (keys.length < 2) return false;
-  const steps = Math.min(40, node.kind.spec?.spacing?.steps ?? 12);
-  const samples = [keys[0]];
-  for (let j = 1; j <= steps; j++) {
-    const mid = lerpNode(keys[0], keys[1], j / (steps + 1));
-    if (mid) samples.push(mid);
+  const spec = node.kind.spec;
+  const steps = Math.min(40, spec?.spacing?.steps ?? 12);
+  const samples = [];
+  for (let i = 0; i < keys.length - 1; i++) {
+    samples.push(placedKey(keys[i], keys, spec, i));
+    for (let j = 1; j <= steps; j++) {
+      const t = j / (steps + 1);
+      const mid = lerpNode(keys[i], keys[i + 1], t);
+      if (!mid) continue;
+      placeStep(mid, keys, spec, i, t);
+      samples.push(mid);
+    }
   }
-  samples.push(keys[keys.length - 1]);
+  samples.push(placedKey(keys[keys.length - 1], keys, spec, keys.length - 1));
   for (const s of samples) {
     const path = s.kind?.path;
     if (!path) continue;

@@ -2,7 +2,7 @@
 
 import {
   applyXf, boundsOf, ellipsePath, ident, include, linePath, mulXf, pathBounds, pathFromAnchors,
-  polygonPath, rotateXf, scaleXf, starPath, subpathBounds, translatePath, translateXf, union,
+  polygonPath, rotateXf, scaleXf, starPath, subpathBounds, transformPath, translatePath, translateXf, union,
 } from "./geom.js";
 import { measureWidth, metricsFor, typoBox } from "./fontmetrics.js";
 
@@ -187,6 +187,12 @@ export function nodeBounds(node) {
     }
     return b;
   }
+  if (k.type === "blend") {
+    let b = null;
+    for (const c of k.children || []) if (c.visible !== false) b = union(b, nodeBounds(c));
+    if (k.spec?.spine) b = union(b, pathBounds(k.spec.spine));
+    return b;
+  }
   const kids = childrenOf(node);
   if (kids) {
     let b = null;
@@ -314,6 +320,9 @@ export function translateNode(node, dx, dy) {
   } else if (k?.type === "repeat") {
     if (k.kind?.center) { k.kind.center.x += dx; k.kind.center.y += dy; }
     for (const c of k.source || []) translateNode(c, dx, dy);
+  } else if (k?.type === "blend") {
+    for (const c of k.children || []) translateNode(c, dx, dy);
+    if (k.spec?.spine) translatePath(k.spec.spine, dx, dy);
   } else {
     const kids = childrenOf(node);
     if (kids) for (const c of kids) translateNode(c, dx, dy);
@@ -344,6 +353,9 @@ export function transformNode(node, xf) {
       }
       p.p = np;
     }
+  } else if (k?.type === "blend") {
+    for (const c of k.children || []) transformNode(c, xf);
+    if (k.spec?.spine) transformPath(k.spec.spine, xf);
   } else {
     const kids = childrenOf(node);
     if (kids) for (const c of kids) transformNode(c, xf);
