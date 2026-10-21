@@ -5,6 +5,7 @@ import {
   polygonPath, reversePath, rotateXf, scaleXf, starPath, strokeOutline, subpathBounds, subpathSignedArea, transformPath, translatePath, translateXf, union,
 } from "./geom.js";
 import { measureWidth, metricsFor, typoBox } from "./fontmetrics.js";
+import { repeatTransforms } from "./render.js";
 
 export const GENERATOR = "VectorCraft";
 
@@ -193,6 +194,7 @@ export function nodeBounds(node) {
     if (k.spec?.spine) b = union(b, pathBounds(k.spec.spine));
     return b;
   }
+  if (k.type === "repeat") return repeatNodeBounds(node);
   const kids = childrenOf(node);
   if (kids) {
     let b = null;
@@ -281,7 +283,13 @@ export function objectLabel(node) {
   if (t === "group") return node.kind.clip ? "Clip Group" : "Group";
   if (t === "blend") return "Blend";
   if (t === "mesh") return "Gradient Mesh";
-  if (t === "repeat") return "Repeat";
+  if (t === "repeat") {
+    const kind = node.kind.kind?.type;
+    if (kind === "radial") return "Radial Repeat";
+    if (kind === "grid") return "Grid Repeat";
+    if (kind === "mirror") return "Mirror Repeat";
+    return "Repeat";
+  }
   if (t === "envelope") return "Envelope";
   if (t === "compound") return "Compound Path";
   if (t === "layer") return node.name || "Layer";
@@ -356,10 +364,25 @@ export function transformNode(node, xf) {
   } else if (k?.type === "blend") {
     for (const c of k.children || []) transformNode(c, xf);
     if (k.spec?.spine) transformPath(k.spec.spine, xf);
+  } else if (k?.type === "repeat") {
+    for (const c of k.source || []) transformNode(c, xf);
+    const kind = k.kind;
+    if (kind?.center) kind.center = applyXf(xf, kind.center);
+    const det = xf[0] * xf[3] - xf[1] * xf[2];
+    const s = Math.sqrt(Math.abs(det)) || 1;
+    if (kind?.type === "radial") kind.radius = Math.max(0, (kind.radius || 0) * s);
+    if (kind?.type === "grid") {
+      kind.hSpacing = (kind.hSpacing || 0) * s;
+      kind.vSpacing = (kind.vSpacing || 0) * s;
+    }
+    if (kind?.type === "mirror" && kind.angle != null) {
+      const o = applyXf(xf, { x: 0, y: 0 });
+      const d = applyXf(xf, { x: Math.cos(kind.angle * Math.PI / 180), y: Math.sin(kind.angle * Math.PI / 180) });
+      kind.angle = Math.atan2(d.y - o.y, d.x - o.x) * 180 / Math.PI;
+    }
   } else {
     const kids = childrenOf(node);
     if (kids) for (const c of kids) transformNode(c, xf);
-    if (k?.type === "repeat" && k.kind?.center) k.kind.center = applyXf(xf, k.kind.center);
   }
 }
 
@@ -869,6 +892,211 @@ export function outlineStrokes(file, ids) {
   }
   if (!out.length) return { error: "Outline Stroke: no stroked paths selected" };
   return { ids: out };
+}
+
+function repeatNodeBounds(node) {
+  const sources = node.kind?.source || [];
+  let src = null;
+  for (const c of sources) if (c.visible !== false) src = union(src, nodeBounds(c));
+  if (!src) return null;
+  let b = null;
+  for (const xf of repeatTransforms(node.kind.kind || {}, src)) {
+    for (const p of [
+      { x: src.x0, y: src.y0 }, { x: src.x1, y: src.y0 },
+      { x: src.x0, y: src.y1 }, { x: src.x1, y: src.y1 },
+    ]) b = include(b, applyXf(xf, p));
+  }
+  return b;
+}
+
+function repeatRoots(file, ids) {
+  const { map, parent } = indexNodes(file);
+  const idset = new Set(ids || []);
+  const tops = [];
+  for (const id of paintOrderIds(file, ids || [])) {
+    const node = map.get(id);
+    if (!node || node.kind?.type === "layer") continue;
+    let nested = false;
+    let p = parent.get(id);
+    while (p) {
+      if (idset.has(p.id)) { nested = true; break; }
+      p = parent.get(p.id);
+    }
+    if (!nested) tops.push(node);
+  }
+  return tops;
+}
+
+function sourceBounds(nodes) {
+  let b = null;
+  for (const n of nodes) b = union(b, nodeBounds(n));
+  return b || { x0: 0, y0: 0, x1: 10, y1: 10 };
+}
+
+function clampCount(v, fallback, max) {
+  const n = v == null || v === "" ? fallback : Math.round(+v);
+  if (!(n >= 1 && n <= max)) return null;
+  return n;
+}
+
+function repeatKind(type, nodes, opts = {}) {
+  const b = sourceBounds(nodes);
+  const w = Math.max(0, b.x1 - b.x0);
+  const h = Math.max(0, b.y1 - b.y0);
+  const cx = (b.x0 + b.x1) / 2;
+  const cy = (b.y0 + b.y1) / 2;
+  if (type === "grid") {
+    const rows = clampCount(opts.rows, 3, 500);
+    const cols = clampCount(opts.cols, 3, 500);
+    if (rows == null || cols == null) return { error: "Rows and columns must be 1 to 500" };
+    return {
+      type: "grid",
+      hSpacing: opts.hSpacing == null ? w / 4 : +opts.hSpacing,
+      vSpacing: opts.vSpacing == null ? h / 4 : +opts.vSpacing,
+      rows, cols,
+      gridType: { type: "grid" },
+      flipRows: false,
+      flipCols: false,
+    };
+  }
+  if (type === "mirror") {
+    const offset = opts.offset == null ? 10 : +opts.offset;
+    return { type: "mirror", angle: opts.angle == null ? 90 : +opts.angle, center: { x: b.x1 + offset, y: cy } };
+  }
+  const instances = clampCount(opts.instances, 8, 1000);
+  if (instances == null) return { error: "Instances must be 1 to 1000" };
+  const radius = opts.radius == null ? Math.max(10, Math.max(w, h) * 1.2) : Math.max(0, +opts.radius);
+  return {
+    type: "radial",
+    instances,
+    radius,
+    center: { x: cx, y: cy + radius },
+    reverseOverlap: false,
+    startAngle: 0,
+    endAngle: 360,
+  };
+}
+
+const REPEAT_NAMES = { radial: "Radial Repeat", grid: "Grid Repeat", mirror: "Mirror Repeat" };
+
+/** Wrap the selection in a repeat, or switch a selected repeat to this kind. */
+export function makeRepeat(file, ids, type, opts = {}) {
+  const roots = repeatRoots(file, ids);
+  if (!roots.length) return { error: "Select the art to repeat" };
+  if (roots.length === 1 && roots[0].kind?.type === "repeat") {
+    const kind = repeatKind(type, roots[0].kind.source || [], opts);
+    if (kind.error) return kind;
+    roots[0].kind.kind = kind;
+    return { id: roots[0].id };
+  }
+  const kind = repeatKind(type, roots, opts);
+  if (kind.error) return kind;
+  const node = blankNode(allocId(file), { type: "repeat", kind, source: roots }, { items: [] });
+  node.name = REPEAT_NAMES[type] || "Repeat";
+  placeWrapped(file, roots, node);
+  return { id: node.id };
+}
+
+export function releaseRepeat(file, ids) {
+  const { map, parent } = indexNodes(file);
+  const reps = (ids || []).map((id) => map.get(id)).filter((n) => n?.kind?.type === "repeat");
+  if (!reps.length) return { error: "Select a repeat" };
+  const out = [];
+  for (const n of reps) {
+    const art = n.kind.source || [];
+    const list = childrenOf(parent.get(n.id));
+    const at = list?.indexOf(n) ?? -1;
+    if (at >= 0) list.splice(at, 1, ...art);
+    out.push(...art.map((c) => c.id));
+  }
+  return { ids: out };
+}
+
+/** Replace each selected repeat with a group of its instances. The repeat keeps its id. */
+export function expandRepeat(file, ids) {
+  const { map } = indexNodes(file);
+  const reps = (ids || []).map((id) => map.get(id)).filter((n) => n?.kind?.type === "repeat");
+  if (!reps.length) return { error: "Select a repeat" };
+  const out = [];
+  for (const n of reps) {
+    const sources = n.kind.source || [];
+    const xfs = repeatTransforms(n.kind.kind || {}, sourceBounds(sources));
+    const instances = xfs.map((xf) => {
+      const children = sources.map((s) => {
+        const copy = deepClone(s);
+        reassignIds(file, copy);
+        transformNode(copy, xf);
+        return copy;
+      });
+      return blankNode(allocId(file), { type: "group", children, clip: false }, { items: [] });
+    });
+    n.kind = { type: "group", children: instances, clip: false };
+    if (!n.name) n.name = "Group";
+    out.push(n.id);
+  }
+  return { ids: out };
+}
+
+export function readRepeatOptions(node) {
+  const k = node?.kind?.kind || {};
+  return {
+    type: k.type || "radial",
+    instances: k.instances ?? 8,
+    radius: k.radius ?? 0,
+    reverseOverlap: !!k.reverseOverlap,
+    startAngle: k.startAngle ?? 0,
+    endAngle: k.endAngle ?? 360,
+    center: k.center ? { x: k.center.x, y: k.center.y } : { x: 0, y: 0 },
+    hSpacing: k.hSpacing ?? 0,
+    vSpacing: k.vSpacing ?? 0,
+    rows: k.rows ?? 3,
+    cols: k.cols ?? 3,
+    gridType: k.gridType?.type || "grid",
+    brickOffset: k.gridType?.offset ?? 0.5,
+    flipRows: !!k.flipRows,
+    flipCols: !!k.flipCols,
+    angle: k.angle ?? 90,
+  };
+}
+
+const GRID_TYPES = ["grid", "brickByRow", "brickByColumn", "hexByColumn", "hexByRow"];
+
+/** Apply Repeat Options to one repeat. Absent fields are left alone. */
+export function writeRepeatOptions(node, fields) {
+  const k = node?.kind?.type === "repeat" ? node.kind.kind : null;
+  if (!k) return { error: "Select a repeat" };
+  const instances = fields.instances == null ? null : clampCount(fields.instances, null, 1000);
+  const rows = fields.rows == null ? null : clampCount(fields.rows, null, 500);
+  const cols = fields.cols == null ? null : clampCount(fields.cols, null, 500);
+  if (k.type === "radial" && fields.instances != null && instances == null) return { error: "Instances must be 1 to 1000" };
+  if (k.type === "grid" && ((fields.rows != null && rows == null) || (fields.cols != null && cols == null))) {
+    return { error: "Rows and columns must be 1 to 500" };
+  }
+  if (k.type === "radial") {
+    if (instances != null) k.instances = instances;
+    if (fields.radius != null) k.radius = Math.max(0, +fields.radius || 0);
+    if (fields.reverseOverlap != null) k.reverseOverlap = !!fields.reverseOverlap;
+    if (fields.startAngle != null) k.startAngle = +fields.startAngle || 0;
+    if (fields.endAngle != null) k.endAngle = +fields.endAngle;
+  } else if (k.type === "grid") {
+    if (rows != null) k.rows = rows;
+    if (cols != null) k.cols = cols;
+    if (fields.hSpacing != null) k.hSpacing = +fields.hSpacing || 0;
+    if (fields.vSpacing != null) k.vSpacing = +fields.vSpacing || 0;
+    if (fields.gridType && GRID_TYPES.includes(fields.gridType)) {
+      k.gridType = fields.gridType === "brickByRow" || fields.gridType === "brickByColumn"
+        ? { type: fields.gridType, offset: fields.brickOffset == null ? 0.5 : +fields.brickOffset }
+        : { type: fields.gridType };
+    }
+    if (fields.flipRows != null) k.flipRows = !!fields.flipRows;
+    if (fields.flipCols != null) k.flipCols = !!fields.flipCols;
+  } else if (k.type === "mirror" && fields.angle != null) {
+    k.angle = +fields.angle || 0;
+  }
+  if (fields.center && (k.type === "radial" || k.type === "mirror")) {
+    k.center = { x: +fields.center.x || 0, y: +fields.center.y || 0 };
+  }
+  return { id: node.id };
 }
 
 export function ungroup(file, ids) {

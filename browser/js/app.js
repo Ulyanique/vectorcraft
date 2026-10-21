@@ -7,7 +7,7 @@ import {
   activeLayer, addToLayer, alignNodes, allocId, artboardBounds, blankNode, childrenOf, collectTop,
   deepClone, defaultAppearance, duplicateNodes, groupNodes, hideNodes, indexNodes, loadFile, lockNodes,
   makeEllipse, makeLine, makePathNode, makePolygon, makeRect, makeStar, makeText, newFile,
-  clipEditTargets, joinPaths, makeClippingMask, makeCompoundPath, nodeBounds, nonePaint, objectLabel, outlineStrokes, primaryFill, primaryStroke, releaseClippingMask, releaseCompoundPath, removeNodes, reorder, reversePathDirections,
+  clipEditTargets, expandRepeat, joinPaths, makeClippingMask, makeCompoundPath, makeRepeat, nodeBounds, nonePaint, objectLabel, outlineStrokes, primaryFill, primaryStroke, readRepeatOptions, releaseClippingMask, releaseCompoundPath, releaseRepeat, removeNodes, reorder, reversePathDirections, writeRepeatOptions,
   restore, selectionBounds, setBlend, setOpacity, setPaint, setText, showAll, snapshot,
   solid, textOf, translateNode, transformNode, ungroup, unlockAll, fillsOf,
 } from "./model.js";
@@ -17,7 +17,7 @@ import { addLinesAt, locateUv, meshFromPath, meshLinesPath, moveMeshPoint, point
 import {
   addSpineAnchor, bendSpineSegment, blendSpine, moveSpineAnchor, nearestOnSubpath, readBlendOptions, removeSpineAnchor, spinePointAt, stepsBetween, writeBlendOptions,
 } from "./blend.js";
-import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
+import { artboardSVG, blendHit, expandBlend, renderDocument, repeatTransforms } from "./render.js";
 import {
   cornerWidgets, hitCornerWidget, invertXf, liveCorners, liveShapeSpec, nextCornerKind, radiusChange,
   setEllipsePie, setLiveCorners, setPolygonSides,
@@ -788,6 +788,9 @@ function paintMeshPoints(parts) {
   }
 }
 
+function selectedRepeats() {
+  return selectedNodes().filter((n) => n.kind?.type === "repeat");
+}
 function selectedBlends() {
   const d = doc();
   if (!d) return [];
@@ -1014,6 +1017,17 @@ function compoundHit(node, p) {
   return hitFill(path, p, node.kind?.rule || "NonZero") || (width > 0 && hitStroke(path, p, width)) || hitStroke(path, p, 3);
 }
 
+function hitRepeat(node, p) {
+  const sources = node.kind?.source || [];
+  if (!sources.length) return false;
+  let b = null;
+  for (const src of sources) b = union(b, nodeBounds(src));
+  const xfs = repeatTransforms(node.kind?.kind || {}, b || { x0: 0, y0: 0, x1: 1, y1: 1 });
+  for (let i = xfs.length - 1; i >= 0; i--) {
+    if (hitDeep(sources, applyXf(invertXf(xfs[i]), p))) return true;
+  }
+  return false;
+}
 function hitSelect(nodes, p) {
   if (!nodes) return null;
   for (let i = nodes.length - 1; i >= 0; i--) {
@@ -1030,7 +1044,11 @@ function hitSelect(nodes, p) {
       if (compoundHit(n, p)) return n;
       continue;
     }
-    if (t === "group" || t === "blend" || t === "repeat" || t === "envelope") {
+    if (t === "repeat") {
+      if (hitRepeat(n, p)) return n;
+      continue;
+    }
+    if (t === "group" || t === "blend" || t === "envelope") {
       const inner = hitDeep(childrenOf(n), p) || (t === "blend" && blendHit(n, p) ? n : null);
       if (inner) return n;
     } else if (hitsGeometry(n, p)) return n;
@@ -1413,6 +1431,21 @@ async function outlineGroup(file, node, faces) {
 
 /* ---------- commands ---------- */
 
+function commitRepeat(run, select) {
+  const d = doc();
+  if (!d) return;
+  const before = snapshot(d.file);
+  const result = run(d);
+  if (!result || result.error) { toast(result?.error || "Select the art to repeat"); return; }
+  d.history.push(before);
+  if (d.history.length > 80) d.history.shift();
+  d.future = [];
+  d.dirty = true;
+  layersApi()?.clearThumbs();
+  if (select) d.selection = select(result);
+  paint();
+  refreshChrome();
+}
 const commands = {
   new: () => openModal("new"),
   open: () => pickFile(),
@@ -1536,6 +1569,12 @@ const commands = {
     paint();
     refreshChrome();
   },
+  makeRadialRepeat: () => commitRepeat((d) => makeRepeat(d.file, d.selection, "radial"), (r) => [r.id]),
+  makeGridRepeat: () => commitRepeat((d) => makeRepeat(d.file, d.selection, "grid"), (r) => [r.id]),
+  makeMirrorRepeat: () => commitRepeat((d) => makeRepeat(d.file, d.selection, "mirror"), (r) => [r.id]),
+  releaseRepeat: () => commitRepeat((d) => releaseRepeat(d.file, d.selection), (r) => r.ids),
+  expandRepeat: () => commitRepeat((d) => expandRepeat(d.file, d.selection), (r) => r.ids),
+  repeatOptions: () => openRepeatOptions(),
   releaseCompoundPath: () => {
     const d = doc();
     if (!d) return;
@@ -1992,6 +2031,31 @@ function expandSelection() {
   paint(); refreshChrome();
 }
 
+function openRepeatOptions() {
+  if (!doc()) { toast("Open a document first"); return; }
+  if (!selectedRepeats().length) { toast("Select a repeat"); return; }
+  openModal("repeat");
+}
+function repeatFieldsFrom(back, type) {
+  const num = (field) => {
+    const el = back.querySelector(`[data-field="${field}"]`);
+    return el && el.value !== "" ? +el.value : null;
+  };
+  if (type === "grid") {
+    return {
+      rows: num("rprows"), cols: num("rpcols"), hSpacing: num("rph"), vSpacing: num("rpv"),
+      gridType: back.querySelector("#rp-grid")?.value,
+      flipRows: !!back.querySelector("#rp-flipr")?.checked,
+      flipCols: !!back.querySelector("#rp-flipc")?.checked,
+    };
+  }
+  if (type === "mirror") return { angle: num("rpangle"), center: { x: num("rpcx"), y: num("rpcy") } };
+  return {
+    instances: num("rpinst"), radius: num("rpradius"), startAngle: num("rpstart"), endAngle: num("rpend"),
+    reverseOverlap: !!back.querySelector("#rp-reverse")?.checked,
+    center: { x: num("rpcx"), y: num("rpcy") },
+  };
+}
 function openBlendOptions() {
   if (!doc()) { toast("Open a document first"); return; }
   openModal("blend");
@@ -3599,6 +3663,14 @@ function menuItems(name) {
       { label: "Hide", cmd: "hide", sc: "Ctrl+3" },
       { label: "Show All", cmd: "showAll" },
       { sep: true },
+      { label: "Repeat", items: [
+        { label: "Radial", cmd: "makeRadialRepeat" },
+        { label: "Grid", cmd: "makeGridRepeat" },
+        { label: "Mirror", cmd: "makeMirrorRepeat" },
+        { label: "Release", cmd: "releaseRepeat" },
+        { label: "Options…", cmd: "repeatOptions" },
+        { label: "Expand", cmd: "expandRepeat" },
+      ] },
       { label: "Blend", items: [
         { label: "Make", cmd: "makeBlend" },
         { label: "Blend Options…", cmd: "blendOptions" },
@@ -3974,6 +4046,7 @@ function drawTaskbar() {
     ${n.length > 1 ? `<button class="act" data-cmd="makeClippingMask">${icon("rectangle", 14)} Make Clipping Mask</button><button class="act" data-cmd="makeCompoundPath">${icon("pathfinder", 14)} Compound Path</button>` : ""}
     ${n.some((node) => node.kind?.type === "compound" || (node.kind?.path?.subpaths?.length || 0) > 1) ? `<button class="act" data-cmd="releaseCompoundPath">${icon("pathfinder", 14)} Release</button>` : ""}
     ${selectedBlends().length ? `<button class="act" data-cmd="blendOptions">${icon("blend", 14)} Blend Options</button>` : ""}
+    ${selectedRepeats().length ? `<button class="act" data-cmd="repeatOptions">${icon("polygon", 14)} Repeat Options</button><button class="act" data-cmd="releaseRepeat">${icon("polygon", 14)} Release</button>` : ""}
     ${canJoinSelection(n) ? `<button class="act" data-cmd="join">${icon("pen", 14)} Join</button>` : ""}
     ${canOutlineSelection(n) ? `<button class="act" data-cmd="outlineStroke">${icon("width", 14)} Outline Stroke</button>` : ""}
     ${isPath && n.length === 1 ? `<button class="act" data-cmd="offsetPath">${icon("rectangle", 14)} Offset Path</button><button class="act" data-cmd="simplify">${icon("curvature", 14)} Simplify</button>` : ""}
@@ -4341,6 +4414,7 @@ function propertiesHTML(n, nodes) {
       ${canOutlineSelection(nodes) ? `<button class="btn" data-cmd="outlineStroke">Outline Stroke</button>` : ""}
       ${selectionHasPath(nodes) ? `<button class="btn" data-cmd="reversePath">Reverse Path</button>` : ""}
       ${nodes[0]?.kind?.live ? `<button class="btn" data-cmd="expandShape">Expand Shape</button>` : ""}
+      ${selectedRepeats().length ? `<button class="btn" data-cmd="repeatOptions">Repeat Options…</button><button class="btn" data-cmd="releaseRepeat">Release Repeat</button><button class="btn" data-cmd="expandRepeat">Expand Repeat</button>` : nodes.length ? `<button class="btn" data-cmd="makeRadialRepeat">Radial Repeat</button>` : ""}
       ${selectedBlends().length ? `<button class="btn" data-cmd="blendOptions">Blend Options…</button>` : ""}
       ${artworkColors(nodes).length > 1 ? `<button class="btn" data-cmd="recolor">Recolor</button>` : ""}
       <button class="btn" data-cmd="offsetPath">Offset Path</button>
@@ -4900,6 +4974,29 @@ function openModal(kind) {
       <select class="full" id="mesh-look"><option value="flat">Flat</option><option value="center">To Center</option><option value="edge">To Edge</option></select></div>
     <div class="row"><label style="width:90px;color:var(--text-dim)">Highlight</label><input class="full" data-field="mhi" type="number" min="0" max="100" value="100"/></div>
     <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="mesh-ok">OK</button></div>`;
+  else if (kind === "repeat") {
+    const target = selectedRepeats()[0];
+    const f = readRepeatOptions(target);
+    const grids = [["grid", "Grid"], ["brickByRow", "Brick by Row"], ["brickByColumn", "Brick by Column"], ["hexByColumn", "Hex by Column"], ["hexByRow", "Hex by Row"]];
+    const radial = f.type === "radial";
+    const grid = f.type === "grid";
+    inner = `<h2>Repeat Options</h2>
+      <p class="hint">${esc(objectLabel(target))}. Preview updates the selection. OK keeps it as one undo step.</p>
+      ${radial ? `<div class="grid2">${numField("Instances", f.instances, "rpinst")}${numField("Radius", f.radius, "rpradius", "pt")}</div>
+        <div class="grid2">${numField("Start", f.startAngle, "rpstart", "°")}${numField("End", f.endAngle, "rpend", "°")}</div>
+        <div class="grid2">${numField("Center X", f.center.x, "rpcx")}${numField("Center Y", f.center.y, "rpcy")}</div>
+        <div class="row"><label><input type="checkbox" id="rp-reverse" ${f.reverseOverlap ? "checked" : ""}/> Reverse Overlap</label></div>` : ""}
+      ${grid ? `<div class="grid2">${numField("Rows", f.rows, "rprows")}${numField("Columns", f.cols, "rpcols")}</div>
+        <div class="grid2">${numField("H Spacing", f.hSpacing, "rph", "pt")}${numField("V Spacing", f.vSpacing, "rpv", "pt")}</div>
+        <div class="row"><label style="width:90px;color:var(--text-dim)">Tile</label>
+          <select class="full" id="rp-grid">${grids.map(([id, label]) => `<option value="${id}" ${f.gridType === id ? "selected" : ""}>${label}</option>`).join("")}</select></div>
+        <div class="row"><label><input type="checkbox" id="rp-flipr" ${f.flipRows ? "checked" : ""}/> Flip Rows</label>
+          <label><input type="checkbox" id="rp-flipc" ${f.flipCols ? "checked" : ""}/> Flip Columns</label></div>` : ""}
+      ${f.type === "mirror" ? `<div class="grid2">${numField("Angle", f.angle, "rpangle", "°")}</div>
+        <div class="grid2">${numField("Center X", f.center.x, "rpcx")}${numField("Center Y", f.center.y, "rpcy")}</div>` : ""}
+      <div class="row"><label><input type="checkbox" id="rp-preview" checked/> Preview</label></div>
+      <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="rp-ok">OK</button></div>`;
+  }
   else if (kind === "setup") {
     const ab = d?.file.document.artboards?.[0]?.rect;
     inner = `<h2>Document Setup</h2>
@@ -4954,6 +5051,37 @@ function openModal(kind) {
       targets.forEach((b, i) => { b.kind.spec = JSON.parse(before[i]); });
       pushHistory();
       targets.forEach((b, i) => { b.kind.spec = next[i]; });
+      back.remove();
+      paint();
+      refreshChrome();
+    };
+  }
+  if (kind === "repeat") {
+    const targets = selectedRepeats();
+    const before = targets.map((n) => JSON.stringify(n.kind.kind));
+    const type = targets[0]?.kind?.kind?.type || "radial";
+    const restore = () => { targets.forEach((n, i) => { n.kind.kind = JSON.parse(before[i]); }); paint(); };
+    const apply = () => {
+      restore();
+      const fields = repeatFieldsFrom(back, type);
+      for (const n of targets) {
+        const result = writeRepeatOptions(n, fields);
+        if (result.error) { toast(result.error); restore(); return false; }
+      }
+      paint();
+      return true;
+    };
+    back.addEventListener("mousedown", (e) => { if (e.target === back) restore(); }, true);
+    back.querySelectorAll("[data-x]").forEach((b) => b.onclick = () => { restore(); back.remove(); });
+    const changed = () => { if (back.querySelector("#rp-preview")?.checked) apply(); else restore(); };
+    back.querySelectorAll("input, select").forEach((el) => { el.oninput = changed; el.onchange = changed; });
+    back.querySelector("#rp-ok").onclick = () => {
+      if (!apply()) return;
+      const next = targets.map((n) => JSON.stringify(n.kind.kind));
+      restore();
+      if (next.every((raw, i) => raw === before[i])) { back.remove(); return; }
+      pushHistory();
+      targets.forEach((n, i) => { n.kind.kind = JSON.parse(next[i]); });
       back.remove();
       paint();
       refreshChrome();
