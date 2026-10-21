@@ -675,3 +675,244 @@ export function simplify(pts, tol) {
   }
   return pts.filter((_, i) => keep[i]).map((p) => ({ ...p }));
 }
+
+function cross(a, b) { return a.x * b.y - a.y * b.x; }
+function polyArea(pts) {
+  let a = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) a += pts[j].x * pts[i].y - pts[i].x * pts[j].y;
+  return a / 2;
+}
+function cleanPolyline(pts, closed) {
+  const out = [];
+  for (const p of pts) {
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    if (!out.length || Math.hypot(p.x - out[out.length - 1].x, p.y - out[out.length - 1].y) > 0.04) out.push({ x: p.x, y: p.y });
+  }
+  if (closed && out.length > 1 && Math.hypot(out[0].x - out[out.length - 1].x, out[0].y - out[out.length - 1].y) <= 0.04) out.pop();
+  return out;
+}
+function lineIntersect(p, p2, q, q2) {
+  const r = sub(p2, p), s = sub(q2, q);
+  const den = cross(r, s);
+  if (Math.abs(den) < 1e-9) return null;
+  return add(p, mul(r, cross(sub(q, p), s) / den));
+}
+function ringSubpath(pts) {
+  return {
+    closed: true,
+    anchors: pts.map((p) => ({ p: { x: p.x, y: p.y }, in: { x: p.x, y: p.y }, out: { x: p.x, y: p.y }, kind: "Corner" })),
+  };
+}
+
+/** Offset a polyline by `delta` (left of the direction when positive). */
+function offsetPolyline(pts, delta, join, miterLimit, closed) {
+  const n = pts.length;
+  const out = [];
+  const last = closed ? n : n;
+  for (let i = 0; i < last; i++) {
+    const cur = pts[i];
+    const prev = closed ? pts[(i - 1 + n) % n] : i > 0 ? pts[i - 1] : null;
+    const next = closed ? pts[(i + 1) % n] : i < n - 1 ? pts[i + 1] : null;
+    const dir = norm(prev ? sub(cur, prev) : sub(next, cur));
+    if (!prev || !next) {
+      out.push(add(cur, mul({ x: -dir.y, y: dir.x }, delta)));
+      continue;
+    }
+    const e0 = norm(sub(cur, prev));
+    const e1 = norm(sub(next, cur));
+    const n0 = { x: -e0.y, y: e0.x };
+    const n1 = { x: -e1.y, y: e1.x };
+    const a = add(cur, mul(n0, delta));
+    const b = add(cur, mul(n1, delta));
+    const pushBevel = () => {
+      if (dist(a, b) > 0.05) out.push(a, b);
+      else out.push(a);
+    };
+    if (join === "Round" && dist(a, b) > 0.05) {
+      out.push(a, ...arcBetween(cur, a, b, Math.abs(delta)), b);
+      continue;
+    }
+    if (join === "Bevel") { pushBevel(); continue; }
+    const hit = lineIntersect(a, add(a, e0), b, add(b, e1));
+    const side = add(mul(n0, delta), mul(n1, delta));
+    if (!hit || dist(cur, hit) > Math.max(1, miterLimit) * Math.abs(delta) || dot(sub(hit, cur), side) <= 0) pushBevel();
+    else out.push(hit);
+  }
+  return out;
+}
+
+function arcBetween(center, from, to, radius) {
+  const a0 = Math.atan2(from.y - center.y, from.x - center.x);
+  const a1 = Math.atan2(to.y - center.y, to.x - center.x);
+  let sweep = a1 - a0;
+  while (sweep <= -Math.PI) sweep += Math.PI * 2;
+  while (sweep > Math.PI) sweep -= Math.PI * 2;
+  if (Math.abs(sweep) < 0.08) return [];
+  const steps = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 6)));
+  const pts = [];
+  for (let i = 1; i < steps; i++) {
+    const a = a0 + sweep * (i / steps);
+    pts.push({ x: center.x + Math.cos(a) * radius, y: center.y + Math.sin(a) * radius });
+  }
+  return pts;
+}
+
+function capPoints(center, from, to, tangent, half, cap) {
+  if (cap === "Square") return [add(from, mul(tangent, half)), add(to, mul(tangent, half))];
+  if (cap !== "Round") return [];
+  const a0 = Math.atan2(from.y - center.y, from.x - center.x);
+  const a1 = Math.atan2(to.y - center.y, to.x - center.x);
+  let ccw = a1 - a0;
+  while (ccw <= 0) ccw += Math.PI * 2;
+  while (ccw > Math.PI * 2) ccw -= Math.PI * 2;
+  const startDir = { x: -Math.sin(a0), y: Math.cos(a0) };
+  const sweep = dot(startDir, tangent) >= 0 ? ccw : ccw - Math.PI * 2;
+  const steps = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 8)));
+  const pts = [];
+  for (let i = 1; i < steps; i++) {
+    const a = a0 + sweep * (i / steps);
+    pts.push({ x: center.x + Math.cos(a) * half, y: center.y + Math.sin(a) * half });
+  }
+  return pts;
+}
+
+function openOutline(pts, half, cap, join, miterLimit) {
+  if (pts.length < 2) return null;
+  const left = offsetPolyline(pts, half, join, miterLimit, false);
+  const right = offsetPolyline(pts, -half, join, miterLimit, false);
+  if (left.length < 2 || right.length < 2) return null;
+  const endTan = norm(sub(pts[pts.length - 1], pts[pts.length - 2]));
+  const startTan = norm(sub(pts[0], pts[1]));
+  return [
+    ...left,
+    ...capPoints(pts[pts.length - 1], left[left.length - 1], right[right.length - 1], endTan, half, cap),
+    ...right.slice().reverse(),
+    ...capPoints(pts[0], right[0], left[0], startTan, half, cap),
+  ];
+}
+
+function oppose(hole, outer) {
+  if (polyArea(hole) * polyArea(outer) > 0) return hole.slice().reverse();
+  return hole;
+}
+
+function centroid(pts) {
+  let x = 0, y = 0;
+  for (const p of pts) { x += p.x; y += p.y; }
+  return { x: x / pts.length, y: y / pts.length };
+}
+
+/** An inset that has crossed the middle is larger than the path, or leaves it. Drop it so the stroke fills solid. */
+function insetOk(inner, pathPts) {
+  if (inner.length < 3) return false;
+  if (Math.abs(polyArea(inner)) >= Math.abs(polyArea(pathPts)) * 0.98) return false;
+  if (!pointInRing(centroid(inner), pathPts)) return false;
+  return inner.every((p) => pointInRing(p, pathPts));
+}
+
+function closedOutline(pts, half, join, miterLimit, align) {
+  const pos = offsetPolyline(pts, half, join, miterLimit, true);
+  const neg = offsetPolyline(pts, -half, join, miterLimit, true);
+  if (pos.length < 3 && neg.length < 3) return [];
+  const ap = Math.abs(polyArea(pos)), an = Math.abs(polyArea(neg));
+  const outer = ap >= an ? pos : neg;
+  const rawInner = ap >= an ? neg : pos;
+  const inner = insetOk(rawInner, pts) ? oppose(rawInner, outer) : null;
+  if (align === "Inside") {
+    if (!inner) return [pts];
+    return [pts, oppose(inner, pts)];
+  }
+  if (align === "Outside") return [outer, oppose(pts, outer)];
+  return inner ? [outer, inner] : [outer];
+}
+
+function dashPieces(pts, closed, dash) {
+  if (!dash || !Array.isArray(dash.pattern) || !dash.pattern.length) return null;
+  let pat = dash.pattern.map(Number);
+  if (pat.some((v) => !Number.isFinite(v) || v < 0) || !pat.some((v) => v > 0)) return null;
+  if (pat.length % 2) pat = pat.concat(pat);
+  const segs = [];
+  const n = closed ? pts.length : pts.length - 1;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len > 1e-4) segs.push({ a, b, len });
+  }
+  const total = segs.reduce((s, g) => s + g.len, 0);
+  const patSum = pat.reduce((s, v) => s + v, 0);
+  if (!(total > 0) || !(patSum > 0)) return null;
+  const at = (d) => {
+    let left = Math.min(Math.max(d, 0), total);
+    for (const g of segs) {
+      if (left <= g.len + 1e-8) {
+        const t = g.len ? left / g.len : 0;
+        return { x: g.a.x + (g.b.x - g.a.x) * t, y: g.a.y + (g.b.y - g.a.y) * t };
+      }
+      left -= g.len;
+    }
+    return { ...segs[segs.length - 1].b };
+  };
+  let phase = ((+dash.offset || 0) % patSum + patSum) % patSum;
+  let pi = 0;
+  while (pi < pat.length && phase >= pat[pi] - 1e-9) { phase -= pat[pi]; pi++; }
+  const pieces = [];
+  let cursor = 0;
+  let guard = 0;
+  while (cursor < total - 1e-4 && guard++ < 10000) {
+    const slot = pat[pi % pat.length];
+    const draw = pi % 2 === 0;
+    if (!(slot > 1e-6)) { pi++; continue; }
+    const take = Math.min(total - cursor, Math.max(0, slot - phase));
+    phase = 0;
+    const end = cursor + take;
+    if (!(end > cursor + 1e-6)) { pi++; continue; }
+    if (draw && end - cursor > 0.05) {
+      const piece = [at(cursor)];
+      let acc = 0;
+      for (const g of segs) {
+        if (acc > cursor + 1e-3 && acc < end - 1e-3) piece.push({ x: g.a.x, y: g.a.y });
+        acc += g.len;
+      }
+      piece.push(at(end));
+      pieces.push(piece);
+    }
+    cursor = end;
+    pi++;
+  }
+  return pieces;
+}
+
+/**
+ * Filled region a stroke paints, as a non-zero path. Centre, inside and outside alignment;
+ * butt, round and square caps; miter, round and bevel joins; a simple dash array.
+ */
+export function strokeOutline(path, stroke) {
+  const width = +stroke?.width;
+  if (!(width > 0) || !Number.isFinite(width)) return { subpaths: [] };
+  const cap = stroke.cap || "Butt";
+  const join = stroke.join || "Miter";
+  const miterLimit = +(stroke.miter_limit ?? stroke.miterLimit ?? 10) || 10;
+  const align = stroke.align || "Center";
+  const subpaths = [];
+  for (const ring of flattenPath(path, 0.35)) {
+    const pts = cleanPolyline(ring.pts, ring.closed);
+    if (pts.length < 2) continue;
+    const dashes = dashPieces(pts, ring.closed && pts.length >= 3, stroke.dash);
+    if (dashes) {
+      for (const piece of dashes) {
+        const ol = openOutline(cleanPolyline(piece, false), width / 2, cap, join, miterLimit);
+        if (ol && ol.length >= 3) subpaths.push(ringSubpath(ol));
+      }
+      continue;
+    }
+    if (ring.closed && pts.length >= 3) {
+      for (const ol of closedOutline(pts, width / 2, join, miterLimit, align)) {
+        if (ol.length >= 3) subpaths.push(ringSubpath(ol));
+      }
+    } else {
+      const ol = openOutline(pts, width / 2, cap, join, miterLimit);
+      if (ol && ol.length >= 3) subpaths.push(ringSubpath(ol));
+    }
+  }
+  return { subpaths };
+}

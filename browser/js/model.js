@@ -2,7 +2,7 @@
 
 import {
   applyXf, boundsOf, ellipsePath, ident, include, linePath, mulXf, pathBounds, pathFromAnchors,
-  polygonPath, reversePath, rotateXf, scaleXf, starPath, subpathBounds, subpathSignedArea, transformPath, translatePath, translateXf, union,
+  polygonPath, reversePath, rotateXf, scaleXf, starPath, strokeOutline, subpathBounds, subpathSignedArea, transformPath, translatePath, translateXf, union,
 } from "./geom.js";
 import { measureWidth, metricsFor, typoBox } from "./fontmetrics.js";
 
@@ -677,6 +677,200 @@ export function releaseCompoundPath(file, ids) {
   return { ids: out };
 }
 
+function endDist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function firstOpenSubpath(node) {
+  return (node?.kind?.path?.subpaths || []).find((sp) => !sp.closed && (sp.anchors || []).length >= 2) || null;
+}
+
+function reverseSubpath(sp) {
+  const anchors = sp.anchors || [];
+  anchors.reverse();
+  for (const a of anchors) {
+    const inn = a.in;
+    a.in = a.out;
+    a.out = inn;
+  }
+}
+
+function cloneAnchor(a) {
+  return {
+    p: { x: a.p.x, y: a.p.y },
+    in: { x: a.in?.x ?? a.p.x, y: a.in?.y ?? a.p.y },
+    out: { x: a.out?.x ?? a.p.x, y: a.out?.y ?? a.p.y },
+    kind: a.kind || "Corner",
+  };
+}
+
+function closeOpenPath(node) {
+  const sp = firstOpenSubpath(node);
+  if (!sp) return { error: "Join: path is already closed" };
+  if (sp.anchors.length > 2) {
+    const first = sp.anchors[0];
+    const last = sp.anchors[sp.anchors.length - 1];
+    if (endDist(first.p, last.p) < 1e-6) {
+      sp.anchors.pop();
+      sp.anchors[0].in = last.in ? { x: last.in.x, y: last.in.y } : { ...sp.anchors[0].p };
+    }
+  }
+  sp.closed = true;
+  if (node.kind.live) delete node.kind.live;
+  return { id: node.id };
+}
+
+/** Join two open paths at their nearest ends, or close one open path. The first path keeps its id. */
+export function joinPaths(file, ids) {
+  const { map } = indexNodes(file);
+  const paths = [];
+  for (const id of ids || []) {
+    const n = map.get(id);
+    if (n?.kind?.type === "path" && !n.kind.guide && !paths.some((p) => p.id === n.id)) paths.push(n);
+  }
+  if (paths.length < 1) return { error: "Join: select open paths" };
+  if (paths.length === 1) return closeOpenPath(paths[0]);
+  const a = paths[0];
+  const b = paths[1];
+  const sa = firstOpenSubpath(a);
+  const sb = firstOpenSubpath(b);
+  if (!sa || !sb) return { error: "Join: paths are already closed" };
+  const xf = sa.anchors[0].p;
+  const xl = sa.anchors[sa.anchors.length - 1].p;
+  const yf = sb.anchors[0].p;
+  const yl = sb.anchors[sb.anchors.length - 1].p;
+  const cands = [
+    [endDist(xl, yf), false, false],
+    [endDist(xl, yl), false, true],
+    [endDist(xf, yf), true, false],
+    [endDist(xf, yl), true, true],
+  ].sort((p, q) => p[0] - q[0]);
+  if (cands[0][1]) reverseSubpath(sa);
+  if (cands[0][2]) reverseSubpath(sb);
+  const last = sa.anchors[sa.anchors.length - 1];
+  const first = sb.anchors[0];
+  const extra = endDist(last.p, first.p) < 1e-6 ? sb.anchors.slice(1) : sb.anchors;
+  if (extra !== sb.anchors) last.out = first.out ? { x: first.out.x, y: first.out.y } : { ...last.p };
+  sa.anchors.push(...extra.map(cloneAnchor));
+  const rest = (b.kind.path.subpaths || []).filter((sp) => sp !== sb);
+  if (rest.length) a.kind.path.subpaths.push(...rest.map((sp) => deepClone(sp)));
+  if (a.kind.live) delete a.kind.live;
+  removeNodes(file, [b.id]);
+  return { id: a.id };
+}
+
+/** Flip every subpath of the selected paths, including paths inside groups and compounds. */
+export function reversePathDirections(file, ids) {
+  const { map } = indexNodes(file);
+  const roots = (ids || []).map((id) => map.get(id)).filter((n) => n && n.kind?.type !== "layer");
+  const paths = [];
+  const visit = (node) => {
+    if (!node || paths.includes(node)) return;
+    if (node.kind?.type === "path" && !node.kind.guide && node.kind.path?.subpaths?.length) paths.push(node);
+    const kids = childrenOf(node);
+    if (kids) for (const c of kids) visit(c);
+  };
+  for (const r of roots) visit(r);
+  if (!paths.length) return { error: "Reverse Path Direction: select paths" };
+  for (const n of paths) {
+    reversePath(n.kind.path);
+    if (n.kind.live) delete n.kind.live;
+  }
+  return { changed: paths.length };
+}
+
+function paintingStroke(it) {
+  return it?.kind === "stroke" && it.visible !== false && it.paint?.type && it.paint.type !== "none" && +it.width > 0;
+}
+
+function paintingFill(it) {
+  return it?.kind === "fill" && it.visible !== false && it.paint?.type && it.paint.type !== "none";
+}
+
+function geometryOf(node) {
+  if (node.kind?.type === "path") return node.kind.path;
+  const subpaths = [];
+  for (const c of node.kind?.children || []) {
+    if (c.kind?.type === "path") subpaths.push(...deepClone(c.kind.path?.subpaths || []));
+  }
+  return { subpaths };
+}
+
+function applyOutline(file, node) {
+  const path = geometryOf(node);
+  const strokes = strokesOf(node).filter(paintingStroke);
+  const fills = fillsOf(node).filter(paintingFill);
+  const effects = node.appearance?.effects;
+  const parts = [];
+  for (const fill of fills) {
+    parts.push(blankNode(allocId(file), {
+      type: "path", path: deepClone(path), rule: node.kind.rule || "NonZero", clipping: false, guide: false,
+    }, { items: [deepClone(fill)] }));
+  }
+  for (const st of strokes) {
+    const outlined = strokeOutline(path, st);
+    if (!outlined.subpaths.length) continue;
+    parts.push(blankNode(allocId(file), {
+      type: "path", path: outlined, rule: "NonZero", clipping: false, guide: false,
+    }, {
+      items: [{
+        kind: "fill", paint: deepClone(st.paint), opacity: st.opacity ?? 1,
+        blend: st.blend || "Normal", visible: true,
+      }],
+    }));
+  }
+  if (!parts.length) return null;
+  if (parts.length === 1) {
+    node.kind = parts[0].kind;
+    node.appearance = parts[0].appearance;
+    if (effects?.length) node.appearance.effects = effects;
+    return [node.id];
+  }
+  const parent = indexNodes(file).parent.get(node.id);
+  if (parent?.kind?.type === "compound") {
+    const list = parent.kind.children;
+    const at = list.findIndex((n) => n.id === node.id);
+    for (const p of parts) {
+      p.opacity = node.opacity ?? 1;
+      p.blend = node.blend || "Normal";
+    }
+    if (at >= 0) list.splice(at, 1, ...parts);
+    return parts.map((p) => p.id);
+  }
+  node.kind = { type: "group", children: parts, clip: false };
+  node.appearance = effects?.length ? { items: [], effects } : { items: [] };
+  if (!node.name) node.name = "Group";
+  return [node.id];
+}
+
+/** Replace each stroked path with its fill plus a filled outline of every stroke. */
+export function outlineStrokes(file, ids) {
+  const { map } = indexNodes(file);
+  const roots = (ids || []).map((id) => map.get(id)).filter((n) => n && n.kind?.type !== "layer");
+  const targets = [];
+  const seen = new Set();
+  const collect = (node) => {
+    if (!node || seen.has(node.id)) return;
+    const stroked = strokesOf(node).some(paintingStroke);
+    if (stroked && (node.kind?.type === "path" && !node.kind.guide || node.kind?.type === "compound")) {
+      seen.add(node.id);
+      targets.push(node);
+      return;
+    }
+    const kids = childrenOf(node);
+    if (kids) for (const c of kids) collect(c);
+  };
+  for (const r of roots) collect(r);
+  if (!targets.length) return { error: "Outline Stroke: no stroked paths selected" };
+  const out = [];
+  for (const node of targets) {
+    const idsOut = applyOutline(file, node);
+    if (idsOut) out.push(...idsOut);
+  }
+  if (!out.length) return { error: "Outline Stroke: no stroked paths selected" };
+  return { ids: out };
+}
+
 export function ungroup(file, ids) {
   const { map, parent } = indexNodes(file);
   const out = [];
@@ -884,7 +1078,7 @@ export function collectTop(file, ids) {
     let p = parent.get(id);
     while (p) { if (ids.includes(p.id)) return false; p = parent.get(p.id); }
     return map.has(id);
-  }).map((id) => map.get(id));
+  });
 }
 
 export function snapshot(file) { return JSON.stringify(file.document); }

@@ -7,7 +7,7 @@ import {
   activeLayer, addToLayer, alignNodes, allocId, artboardBounds, blankNode, childrenOf, collectTop,
   deepClone, defaultAppearance, duplicateNodes, groupNodes, hideNodes, indexNodes, loadFile, lockNodes,
   makeEllipse, makeLine, makePathNode, makePolygon, makeRect, makeStar, makeText, newFile,
-  clipEditTargets, makeClippingMask, makeCompoundPath, nodeBounds, nonePaint, objectLabel, primaryFill, primaryStroke, releaseClippingMask, releaseCompoundPath, removeNodes, reorder,
+  clipEditTargets, joinPaths, makeClippingMask, makeCompoundPath, nodeBounds, nonePaint, objectLabel, outlineStrokes, primaryFill, primaryStroke, releaseClippingMask, releaseCompoundPath, removeNodes, reorder, reversePathDirections,
   restore, selectionBounds, setBlend, setOpacity, setPaint, setText, showAll, snapshot,
   solid, textOf, translateNode, transformNode, ungroup, unlockAll, fillsOf,
 } from "./model.js";
@@ -231,6 +231,28 @@ function selectedNodes() {
   if (!f) return [];
   const { map } = indexNodes(f);
   return collectTop(f, doc().selection).map((id) => map.get(id)).filter(Boolean);
+}
+function canJoinSelection(nodes) {
+  const paths = nodes.filter((n) => n.kind?.type === "path" && !n.kind.guide);
+  const open = (n) => (n.kind.path?.subpaths || []).some((sp) => !sp.closed && (sp.anchors || []).length >= 2);
+  if (paths.length >= 2) return open(paths[0]) && open(paths[1]);
+  return paths.length === 1 && open(paths[0]);
+}
+function walkSelection(nodes, hit) {
+  const stack = [...nodes];
+  while (stack.length) {
+    const n = stack.pop();
+    if (hit(n)) return true;
+    const kids = n.kind?.children || n.kind?.source || n.kind?.content;
+    if (Array.isArray(kids)) stack.push(...kids);
+  }
+  return false;
+}
+function canOutlineSelection(nodes) {
+  return walkSelection(nodes, (n) => (n.appearance?.items || []).some((it) => it.kind === "stroke" && it.visible !== false && it.paint?.type && it.paint.type !== "none" && +it.width > 0));
+}
+function selectionHasPath(nodes) {
+  return walkSelection(nodes, (n) => n.kind?.type === "path" && !n.kind.guide);
 }
 
 function styleNow() {
@@ -1467,6 +1489,50 @@ const commands = {
     d.dirty = true;
     layersApi()?.clearThumbs();
     d.selection = [result.id];
+    paint();
+    refreshChrome();
+  },
+  join: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const result = joinPaths(d.file, d.selection);
+    if (result.error) { toast(result.error); return; }
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    d.selection = [result.id];
+    paint();
+    refreshChrome();
+  },
+  reversePath: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const result = reversePathDirections(d.file, d.selection);
+    if (result.error) { toast(result.error); return; }
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    paint();
+    refreshChrome();
+  },
+  outlineStroke: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const result = outlineStrokes(d.file, d.selection);
+    if (result.error) { toast(result.error); return; }
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    d.selection = result.ids;
     paint();
     refreshChrome();
   },
@@ -3538,6 +3604,13 @@ function menuItems(name) {
         { label: "Blend Options…", cmd: "blendOptions" },
         { label: "Expand", cmd: "expand" },
       ] },
+      { label: "Path", items: [
+        { label: "Join", cmd: "join", sc: "Ctrl+J" },
+        { label: "Outline Stroke", cmd: "outlineStroke" },
+        { label: "Offset Path…", cmd: "offsetPath" },
+        { label: "Simplify…", cmd: "simplify" },
+        { label: "Reverse Path Direction", cmd: "reversePath" },
+      ] },
       { label: "Clipping Mask", items: [
         { label: "Make", cmd: "makeClippingMask", sc: "Ctrl+7" },
         { label: "Release", cmd: "releaseClippingMask", sc: "Ctrl+Alt+7" },
@@ -3644,7 +3717,7 @@ function openSub(items, rect) {
   menu.className = "menu";
   menu.style.left = rect.right + "px";
   menu.style.top = rect.top + "px";
-  menu.innerHTML = items.map((it, i) => `<button class="mi" data-i="${i}"><span class="ck"></span><span>${esc(it.label)}</span></button>`).join("");
+  menu.innerHTML = items.map((it, i) => `<button class="mi" data-i="${i}"><span class="ck"></span><span>${esc(it.label)}</span>${it.sc ? `<span class="sc">${it.sc}</span>` : ""}</button>`).join("");
   document.body.appendChild(menu);
   const box = menu.getBoundingClientRect();
   if (box.right > innerWidth) menu.style.left = (rect.left - box.width) + "px";
@@ -3901,6 +3974,8 @@ function drawTaskbar() {
     ${n.length > 1 ? `<button class="act" data-cmd="makeClippingMask">${icon("rectangle", 14)} Make Clipping Mask</button><button class="act" data-cmd="makeCompoundPath">${icon("pathfinder", 14)} Compound Path</button>` : ""}
     ${n.some((node) => node.kind?.type === "compound" || (node.kind?.path?.subpaths?.length || 0) > 1) ? `<button class="act" data-cmd="releaseCompoundPath">${icon("pathfinder", 14)} Release</button>` : ""}
     ${selectedBlends().length ? `<button class="act" data-cmd="blendOptions">${icon("blend", 14)} Blend Options</button>` : ""}
+    ${canJoinSelection(n) ? `<button class="act" data-cmd="join">${icon("pen", 14)} Join</button>` : ""}
+    ${canOutlineSelection(n) ? `<button class="act" data-cmd="outlineStroke">${icon("width", 14)} Outline Stroke</button>` : ""}
     ${isPath && n.length === 1 ? `<button class="act" data-cmd="offsetPath">${icon("rectangle", 14)} Offset Path</button><button class="act" data-cmd="simplify">${icon("curvature", 14)} Simplify</button>` : ""}
     <button class="act" data-cmd="duplicate">${icon("copy", 14)} Duplicate</button>
     <button data-cmd="panel" data-arg="color" title="Fill"><i class="chip ${fillNone ? "none" : ""}" style="background:${fill?.type === "solid" ? rgbCss(fill.color) : ""}"></i></button>
@@ -4262,6 +4337,9 @@ function propertiesHTML(n, nodes) {
     <div class="qa">
       ${nodes.length > 1 ? `<button class="btn" data-cmd="group">Group</button><button class="btn" data-cmd="makeClippingMask">Make Clipping Mask</button><button class="btn" data-cmd="makeCompoundPath">Compound Path</button>` : ""}
       ${nodes[0]?.kind?.type === "group" ? `<button class="btn" data-cmd="ungroup">Ungroup</button>` : ""}
+      ${canJoinSelection(nodes) ? `<button class="btn" data-cmd="join">Join</button>` : ""}
+      ${canOutlineSelection(nodes) ? `<button class="btn" data-cmd="outlineStroke">Outline Stroke</button>` : ""}
+      ${selectionHasPath(nodes) ? `<button class="btn" data-cmd="reversePath">Reverse Path</button>` : ""}
       ${nodes[0]?.kind?.live ? `<button class="btn" data-cmd="expandShape">Expand Shape</button>` : ""}
       ${selectedBlends().length ? `<button class="btn" data-cmd="blendOptions">Blend Options…</button>` : ""}
       ${artworkColors(nodes).length > 1 ? `<button class="btn" data-cmd="recolor">Recolor</button>` : ""}
@@ -4708,16 +4786,16 @@ function statusXY(p) {
   el.textContent = `X: ${x.toFixed(2)} ${u.suffix}  Y: ${y.toFixed(2)} ${u.suffix}`;
 }
 
+function pushPalette(items, prefix, out) {
+  for (const it of items) {
+    if (it.items) pushPalette(it.items, `${prefix}  ${it.label}`, out);
+    else if (!it.sep) out.push({ ...it, label: `${prefix}  ${it.label}` });
+  }
+}
 function paletteItems() {
   const items = [];
   for (const name of ["File", "Edit", "Object", "Type", "Select", "Effect", "View", "Window", "Help"]) {
-    for (const it of menuItems(name)) {
-      if (it.sep || it.items) {
-        for (const sub of it.items || []) items.push({ ...sub, label: `${name}  ${sub.label}` });
-        continue;
-      }
-      items.push({ ...it, label: `${name}  ${it.label}` });
-    }
+    pushPalette(menuItems(name), name, items);
   }
   for (const t of ALL_TOOLS) items.push({ label: `Tool  ${t.label}`, tool: t.id, sc: t.key || "" });
   const q = ui.query.trim().toLowerCase();
@@ -4762,7 +4840,7 @@ function openModal(kind) {
   else if (kind === "keys") inner = `<h2>Keyboard Shortcuts</h2>
     <p class="hint">V select · A direct select · P pen · T type · M rectangle · L ellipse · N pencil · B brush<br/>
     Z zoom · H hand · R rotate · I eyedropper · G gradient · Space pan<br/>
-    Ctrl+Z undo · Ctrl+S save · Ctrl+E export SVG · Ctrl+0 fit · Ctrl+G group · Del delete<br/>
+    Ctrl+Z undo · Ctrl+S save · Ctrl+E export SVG · Ctrl+0 fit · Ctrl+G group · Ctrl+J join · Del delete<br/>
     Arrows nudge · Shift+arrows nudge 10 · [ ] arrange · Ctrl+K search</p>
     <div class="actions"><button class="btn primary" data-x>Close</button></div>`;
   else if (kind === "blend") {
@@ -4993,7 +5071,7 @@ function onKey(e) {
     const map = {
       z: e.shiftKey ? "redo" : "undo", y: "redo", s: "save", o: "open", n: "new", e: "exportSVG",
       a: e.shiftKey ? "deselect" : "selectAll", c: "copy", x: "cut", v: e.shiftKey ? "pasteInPlace" : "paste",
-      d: "duplicate", g: e.shiftKey ? "ungroup" : "group", w: "close", "7": "makeClippingMask", "8": e.shiftKey ? null : "makeCompoundPath",
+      d: "duplicate", g: e.shiftKey ? "ungroup" : "group", j: "join", w: "close", "7": "makeClippingMask", "8": e.shiftKey ? null : "makeCompoundPath",
       "0": "fitArtboard", "1": "actualSize", "=": "zoomIn", "+": "zoomIn", "-": "zoomOut",
       k: "palette", y: e.shiftKey ? null : "toggleOutline", r: "toggleRulers",
     };
