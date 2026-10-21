@@ -458,6 +458,89 @@ export function groupNodes(file, ids) {
   return g.id;
 }
 
+/** Topmost selected object clips the others, matching `object.clippingMask.make`. */
+export function makeClippingMask(file, ids) {
+  const { map, parent } = indexNodes(file);
+  const idset = new Set(ids);
+  const tops = [];
+  for (const id of ids) {
+    const node = map.get(id);
+    if (!node || node.kind?.type === "layer") continue;
+    let nested = false;
+    let p = parent.get(id);
+    while (p) {
+      if (idset.has(p.id)) { nested = true; break; }
+      p = parent.get(p.id);
+    }
+    if (!nested) tops.push(id);
+  }
+  if (tops.length < 2) return { error: "Select two or more objects" };
+  const par = parent.get(tops[0]);
+  if (!par || tops.some((id) => parent.get(id)?.id !== par.id)) return { error: "Objects must share a parent" };
+  const list = childrenOf(par);
+  if (!list) return { error: "Objects must share a parent" };
+  const roots = list.filter((n) => tops.includes(n.id));
+  if (roots.length < 2) return { error: "Select two or more objects" };
+  const mask = roots[roots.length - 1];
+  const kind = mask.kind?.type;
+  if (mask.kind?.guide || (kind !== "path" && kind !== "compound" && kind !== "text")) {
+    return { error: "The top object must be a path, compound path or text object" };
+  }
+  mask.appearance = defaultAppearance(nonePaint(), nonePaint(), 0);
+  if (kind === "text") {
+    for (const run of mask.kind.runs || []) {
+      if (!run.style) continue;
+      run.style.fill = nonePaint();
+      run.style.stroke = nonePaint();
+    }
+  }
+  if (kind === "path" || kind === "compound") mask.kind.clipping = true;
+  const indexes = roots.map((n) => list.indexOf(n)).filter((i) => i >= 0);
+  const last = indexes[indexes.length - 1];
+  const below = indexes.filter((i) => i < last).length;
+  const at = last - below;
+  for (const i of [...indexes].sort((a, b) => b - a)) list.splice(i, 1);
+  const g = blankNode(allocId(file), { type: "group", clip: true, children: [mask, ...roots.slice(0, -1)] }, { items: [] });
+  g.name = "Clip Group";
+  list.splice(Math.max(0, Math.min(at, list.length)), 0, g);
+  return { id: g.id };
+}
+
+/** Selected clip groups stop clipping. The mask stays, with whatever paint it has. */
+export function releaseClippingMask(file, ids) {
+  const { map } = indexNodes(file);
+  let released = 0;
+  for (const id of ids) {
+    const n = map.get(id);
+    if (n?.kind?.type !== "group" || !n.kind.clip) continue;
+    n.kind.clip = false;
+    const kids = n.kind.children || [];
+    const mask = kids.find((c) => c.kind?.clipping) || kids[0];
+    if (mask?.kind && (mask.kind.type === "path" || mask.kind.type === "compound")) mask.kind.clipping = false;
+    released += 1;
+  }
+  return released;
+}
+
+/** Ids of the clipping path (`mask`) or the clipped contents of the selected clip groups. */
+export function clipEditTargets(file, ids, mask) {
+  const { map, parent } = indexNodes(file);
+  const out = [];
+  for (const id of ids) {
+    let cur = map.get(id);
+    while (cur) {
+      if (cur.kind?.type === "group" && cur.kind.clip) {
+        const kids = cur.kind.children || [];
+        if (mask) { if (kids[0]) out.push(kids[0].id); }
+        else out.push(...kids.slice(1).map((c) => c.id));
+        break;
+      }
+      cur = parent.get(cur.id);
+    }
+  }
+  return [...new Set(out)];
+}
+
 export function ungroup(file, ids) {
   const { map, parent } = indexNodes(file);
   const out = [];

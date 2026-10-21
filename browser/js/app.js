@@ -7,7 +7,7 @@ import {
   activeLayer, addToLayer, alignNodes, allocId, artboardBounds, blankNode, childrenOf, collectTop,
   deepClone, defaultAppearance, duplicateNodes, groupNodes, hideNodes, indexNodes, loadFile, lockNodes,
   makeEllipse, makeLine, makePathNode, makePolygon, makeRect, makeStar, makeText, newFile,
-  nodeBounds, nonePaint, objectLabel, primaryFill, primaryStroke, removeNodes, reorder,
+  clipEditTargets, makeClippingMask, nodeBounds, nonePaint, objectLabel, primaryFill, primaryStroke, releaseClippingMask, removeNodes, reorder,
   restore, selectionBounds, setBlend, setOpacity, setPaint, setText, showAll, snapshot,
   solid, textOf, translateNode, transformNode, ungroup, unlockAll, fillsOf,
 } from "./model.js";
@@ -836,11 +836,45 @@ function hitsGeometry(n, p, tol = 5) {
   return false;
 }
 
+function clipMaskOf(node) {
+  if (node?.kind?.type !== "group" || !node.kind.clip) return null;
+  const kids = node.kind.children || [];
+  return kids.find((c) => c.kind?.clipping) || kids[0] || null;
+}
+
+function maskPathOf(node) {
+  const k = node?.kind;
+  if (!k) return null;
+  if (k.type === "path") return k.path;
+  if (k.type === "compound") {
+    const subpaths = [];
+    for (const c of k.children || []) if (c.kind?.path) subpaths.push(...c.kind.path.subpaths);
+    return { subpaths };
+  }
+  return null;
+}
+
+function pointInMask(mask, p) {
+  if (!mask) return false;
+  const path = maskPathOf(mask);
+  if (path) return hitFill(path, p, mask.kind?.rule) || hitStroke(path, p, 3);
+  const b = nodeBounds(mask);
+  return !!(b && contains(b, p, 1));
+}
+
 function hitDeep(nodes, p) {
   if (!nodes) return null;
   for (let i = nodes.length - 1; i >= 0; i--) {
     const n = nodes[i];
     if (!n || n.visible === false || n.locked) continue;
+    if (n.kind?.type === "group" && n.kind.clip) {
+      const mask = clipMaskOf(n);
+      if (mask && hitsGeometry(mask, p)) return mask;
+      if (!pointInMask(mask, p)) continue;
+      const inner = hitDeep((n.kind.children || []).filter((c) => c !== mask), p);
+      if (inner) return inner;
+      continue;
+    }
     const kids = childrenOf(n);
     if (kids && n.kind.type !== "path") {
       const inner = hitDeep(kids, p);
@@ -857,6 +891,12 @@ function hitSelect(nodes, p) {
     const n = nodes[i];
     if (!n || n.visible === false || n.locked) continue;
     const t = n.kind?.type;
+    if (t === "group" && n.kind.clip) {
+      const mask = clipMaskOf(n);
+      if (!pointInMask(mask, p) && !(mask && hitsGeometry(mask, p))) continue;
+      if (hitDeep(childrenOf(n), p) || (mask && hitsGeometry(mask, p))) return n;
+      continue;
+    }
     if (t === "group" || t === "blend" || t === "repeat" || t === "envelope" || t === "compound") {
       const inner = hitDeep(childrenOf(n), p) || (t === "blend" && blendHit(n, p) ? n : null);
       if (inner) return t === "compound" ? n : (t === "group" ? n : n);
@@ -1288,6 +1328,47 @@ const commands = {
     const id = groupNodes(d.file, d.selection);
     if (id) d.selection = [id];
     paint(); refreshChrome();
+  },
+  makeClippingMask: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const result = makeClippingMask(d.file, d.selection);
+    if (result.error) { toast(result.error); return; }
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    d.selection = [result.id];
+    paint();
+    refreshChrome();
+  },
+  releaseClippingMask: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const n = releaseClippingMask(d.file, d.selection);
+    if (!n) return;
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    paint();
+    refreshChrome();
+  },
+  editClipContents: () => editClip(false),
+  editClipMask: () => editClip(true),
+  expandShape: () => {
+    const d = doc();
+    if (!d) return;
+    const nodes = selectedNodes().filter((n) => n.kind?.live);
+    if (!nodes.length) return;
+    pushHistory();
+    for (const n of nodes) delete n.kind.live;
+    paint();
+    refreshChrome();
   },
   ungroup: () => {
     const d = doc();
@@ -1885,6 +1966,16 @@ function addGlow() {
   }
   paint();
 }
+function editClip(mask) {
+  const d = doc();
+  if (!d) return;
+  const ids = clipEditTargets(d.file, d.selection, mask);
+  if (!ids.length) { toast("Select a clip group"); return; }
+  d.selection = ids;
+  paintOverlay();
+  refreshChrome();
+}
+
 function offsetSelection() {
   const d = doc();
   const nodes = selectedNodes().filter((n) => n.kind?.type === "path");
@@ -3233,6 +3324,12 @@ function menuItems(name) {
         { label: "Blend Options…", cmd: "blendOptions" },
         { label: "Expand", cmd: "expand" },
       ] },
+      { label: "Clipping Mask", items: [
+        { label: "Make", cmd: "makeClippingMask", sc: "Ctrl+7" },
+        { label: "Release", cmd: "releaseClippingMask", sc: "Ctrl+Alt+7" },
+        { label: "Edit Contents", cmd: "editClipContents" },
+        { label: "Edit Clipping Path", cmd: "editClipMask" },
+      ] },
       { label: "Pathfinder", items: [
         { label: "Unite", cmd: "pathfinderUnite" },
         { label: "Minus Front", cmd: "pathfinderMinus" },
@@ -3240,6 +3337,7 @@ function menuItems(name) {
         { label: "Exclude", cmd: "pathfinderExclude" },
       ] },
       { sep: true },
+      { label: "Expand Shape", cmd: "expandShape" },
       { label: "Create Gradient Mesh…", cmd: "createMesh" },
     ],
     Type: [
@@ -3578,6 +3676,7 @@ function drawTaskbar() {
   el.innerHTML = `
     <i class="grip" id="task-grip" title="Drag"></i>
     ${isText ? `<button class="act" data-cmd="createOutlines">${icon("type", 14)} Create Outlines</button>` : ""}
+    ${n.length > 1 ? `<button class="act" data-cmd="makeClippingMask">${icon("rectangle", 14)} Make Clipping Mask</button>` : ""}
     ${selectedBlends().length ? `<button class="act" data-cmd="blendOptions">${icon("blend", 14)} Blend Options</button>` : ""}
     ${isPath && n.length === 1 ? `<button class="act" data-cmd="offsetPath">${icon("rectangle", 14)} Offset Path</button><button class="act" data-cmd="simplify">${icon("curvature", 14)} Simplify</button>` : ""}
     <button class="act" data-cmd="duplicate">${icon("copy", 14)} Duplicate</button>
@@ -3937,8 +4036,11 @@ function propertiesHTML(n, nodes) {
   </div>
   <div class="psec"><h3>Quick Actions</h3>
     <div class="qa">
+      ${nodes.length > 1 ? `<button class="btn" data-cmd="group">Group</button><button class="btn" data-cmd="makeClippingMask">Make Clipping Mask</button>` : ""}
+      ${nodes[0]?.kind?.type === "group" ? `<button class="btn" data-cmd="ungroup">Ungroup</button>` : ""}
+      ${nodes[0]?.kind?.live ? `<button class="btn" data-cmd="expandShape">Expand Shape</button>` : ""}
       ${selectedBlends().length ? `<button class="btn" data-cmd="blendOptions">Blend Options…</button>` : ""}
-      ${artworkColors(selectedNodes()).length > 1 ? `<button class="btn" data-cmd="recolor">Recolor</button>` : ""}
+      ${artworkColors(nodes).length > 1 ? `<button class="btn" data-cmd="recolor">Recolor</button>` : ""}
       <button class="btn" data-cmd="offsetPath">Offset Path</button>
       <button class="btn" data-cmd="simplify">Simplify</button>
       <button class="btn" data-cmd="bringFront">Arrange: Bring to Front</button>
@@ -4573,12 +4675,17 @@ function onKey(e) {
     else commands.deselect();
     return;
   }
+  if ((e.metaKey || e.ctrlKey) && e.altKey && !e.shiftKey && e.key === "7") {
+    e.preventDefault();
+    commands.releaseClippingMask();
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && !e.altKey) {
     const k = e.key.toLowerCase();
     const map = {
       z: e.shiftKey ? "redo" : "undo", y: "redo", s: "save", o: "open", n: "new", e: "exportSVG",
       a: e.shiftKey ? "deselect" : "selectAll", c: "copy", x: "cut", v: e.shiftKey ? "pasteInPlace" : "paste",
-      d: "duplicate", g: e.shiftKey ? "ungroup" : "group", w: "close",
+      d: "duplicate", g: e.shiftKey ? "ungroup" : "group", w: "close", "7": "makeClippingMask",
       "0": "fitArtboard", "1": "actualSize", "=": "zoomIn", "+": "zoomIn", "-": "zoomOut",
       k: "palette", y: e.shiftKey ? null : "toggleOutline", r: "toggleRulers",
     };

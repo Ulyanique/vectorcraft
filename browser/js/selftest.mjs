@@ -3,7 +3,7 @@ import { polygonBoolean } from "./bool.js";
 import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
 import { addSpineAnchor, blendSpine, moveSpineAnchor, readBlendOptions, removeSpineAnchor, stepsBetween, writeBlendOptions } from "./blend.js";
 import { applyRecolor, artworkColors, cluster, colorFromKey, colorKey, keepsNeutral, mapColor, neutralOf, reduceColors, tinted } from "./recolor.js";
-import { loadFile } from "./model.js";
+import { clipEditTargets, loadFile, makeClippingMask, releaseClippingMask } from "./model.js";
 import { ellipsePath, pathD, toRgb, warpDocPoint } from "./geom.js";
 import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
 import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
@@ -193,6 +193,44 @@ const stops = grad.appearance.items[0].paint.gradient.stops;
 if (stops[0].color.g !== 1 || stops[1].color.g !== 1) throw new Error("gradient stops were not recolored");
 if (grad.kind.runs[0].style.fill.color.r !== 0) throw new Error("text fill was not recolored");
 console.log("recolor", rows.join("|"));
+
+function filledRect(id, x, y, w, h, color) {
+  const corner = (px, py) => ({ p: { x: px, y: py }, in: { x: px, y: py }, out: { x: px, y: py }, kind: "Corner" });
+  return {
+    id, visible: true, opacity: 1,
+    appearance: { items: [{ kind: "fill", paint: { type: "solid", color }, opacity: 1, visible: true }] },
+    kind: { type: "path", path: { subpaths: [{ closed: true, anchors: [corner(x, y), corner(x + w, y), corner(x + w, y + h), corner(x, y + h)] }] }, rule: "NonZero", clipping: false, guide: false },
+  };
+}
+const clipFile = {
+  document: {
+    next_id: 10,
+    artboards: [{ id: 1, rect: { x0: 0, y0: 0, x1: 200, y1: 200 } }],
+    layers: [{ id: 1, kind: { type: "layer", children: [
+      filledRect(2, 0, 0, 30, 30, { model: "rgb", r: 0, g: 0, b: 1 }),
+      filledRect(3, 0, 0, 80, 80, { model: "rgb", r: 1, g: 0, b: 0 }),
+      filledRect(4, 40, 40, 20, 20, { model: "rgb", r: 0, g: 1, b: 0 }),
+    ] } }],
+  },
+};
+const refused = makeClippingMask(clipFile, [3]);
+if (!refused.error || clipFile.document.layers[0].kind.children.length !== 3) throw new Error("clip needs two objects");
+const made = makeClippingMask(clipFile, [2, 4]);
+if (made.error || made.id !== 10) throw new Error("make clip " + JSON.stringify(made));
+const layerKids = clipFile.document.layers[0].kind.children;
+if (layerKids.map((n) => n.id).join() !== "3,10") throw new Error("clip group should replace the top object: " + layerKids.map((n) => n.id));
+const clipGroup = layerKids[1];
+if (!clipGroup.kind.clip || clipGroup.kind.children.map((n) => n.id).join() !== "4,2") throw new Error("mask first " + clipGroup.kind.children.map((n) => n.id));
+if (clipGroup.kind.children[0].kind.clipping !== true) throw new Error("mask should clip");
+if (clipGroup.kind.children[0].appearance.items[0].paint.type !== "none") throw new Error("mask paint should be cleared");
+if (clipEditTargets(clipFile, [10], true).join() !== "4") throw new Error("edit mask");
+if (clipEditTargets(clipFile, [2], false).join() !== "2") throw new Error("edit contents from a child");
+const clipped = renderDocument(clipFile);
+if (!clipped.defs.includes("<clipPath") || !clipped.body.includes("clip-path=")) throw new Error("svg clip missing");
+if (clipped.body.includes("rgb(0, 255, 0)") || clipped.body.includes("#00ff00")) throw new Error("mask fill should not paint");
+if (!releaseClippingMask(clipFile, [10])) throw new Error("release");
+if (clipGroup.kind.clip || clipGroup.kind.children[0].kind.clipping) throw new Error("release should stop clipping");
+console.log("clipping mask", made.id);
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];

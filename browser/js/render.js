@@ -71,30 +71,55 @@ function renderNode(node, ctx) {
 
 function renderGroup(node, k, ctx, op) {
   const kids = k.children || [];
-  const clipChild = k.clip ? kids.find((c) => c.kind?.clipping) : null;
-  const clipD = clipPathD(clipChild);
+  if (!k.clip) return kids.map((c) => renderNode(c, { ...ctx, opacity: 1 })).join("");
+  const clipChild = kids.find((c) => c.kind?.clipping) || kids[0];
+  const geom = maskGeometry(clipChild, ctx);
+  const clipD = geom ? pathD(geom) : "";
   const clipId = clipD ? nextId("clip") : null;
-  if (clipId) ctx.defs.push(`<clipPath id="${clipId}"><path d="${clipD}"/></clipPath>`);
+  if (clipId) {
+    const rule = clipChild?.kind?.rule === "EvenOdd" ? ` clip-rule="evenodd"` : "";
+    ctx.defs.push(`<clipPath id="${clipId}"><path d="${clipD}"${rule}/></clipPath>`);
+  }
   const parts = kids
     .filter((c) => !clipId || c !== clipChild)
     .map((c) => renderNode(c, { ...ctx, opacity: 1 }))
     .join("");
-  if (clipId) return `<g clip-path="url(#${clipId})">${parts}</g>`;
-  return parts;
+  const clipped = clipId ? `<g clip-path="url(#${clipId})">${parts}</g>` : parts;
+  // A mask painted after Make shows its fill behind the clipped art and its stroke over it.
+  const under = clipId ? maskPaint(clipChild, geom, ctx, "fill") : "";
+  const over = clipId ? maskPaint(clipChild, geom, ctx, "stroke") : "";
+  if (!under && !over) return clipped;
+  return `${under}${clipped}${over}`;
   void op;
   void node;
 }
 
-function clipPathD(node) {
+function maskGeometry(node, ctx) {
   const k = node?.kind;
-  if (!k) return "";
-  if (k.type === "path") return pathD(k.path);
+  if (!k) return null;
+  if (k.type === "path") return k.path;
   if (k.type === "compound") {
-    const subs = [];
-    for (const c of k.children || []) if (c.kind?.path) subs.push(...c.kind.path.subpaths);
-    return pathD({ subpaths: subs });
+    const subpaths = [];
+    for (const c of k.children || []) if (c.kind?.path) subpaths.push(...c.kind.path.subpaths);
+    return { subpaths };
   }
-  return "";
+  if (k.type === "text") {
+    const outlined = textAsPaths(node, k, ctx);
+    if (!outlined?.length) return null;
+    return { subpaths: outlined.flatMap((n) => n.kind.path.subpaths || []) };
+  }
+  return null;
+}
+
+function maskPaint(node, geom, ctx, which) {
+  if (!node || !geom) return "";
+  const items = (node.appearance?.items || []).filter((it) => it.kind === which && it.visible !== false && it.paint && it.paint.type !== "none" && (which !== "stroke" || (it.width ?? 1) > 0));
+  if (!items.length) return "";
+  return renderNode({
+    ...node,
+    appearance: { items },
+    kind: { type: "path", path: geom, rule: node.kind?.rule || "NonZero", clipping: false, guide: false },
+  }, ctx);
 }
 
 function renderPathNode(node, k, ctx, op) {
