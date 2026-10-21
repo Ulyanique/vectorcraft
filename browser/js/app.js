@@ -18,6 +18,10 @@ import {
   addSpineAnchor, bendSpineSegment, blendSpine, moveSpineAnchor, nearestOnSubpath, readBlendOptions, removeSpineAnchor, spinePointAt, stepsBetween, writeBlendOptions,
 } from "./blend.js";
 import { artboardSVG, blendHit, expandBlend, renderDocument } from "./render.js";
+import {
+  cornerWidgets, hitCornerWidget, invertXf, liveCorners, liveShapeSpec, nextCornerKind, radiusChange,
+  setEllipsePie, setLiveCorners, setPolygonSides,
+} from "./corners.js";
 import { METHODS, applyRecolor, artworkColors, colorHex, hexToColor, reduceColors } from "./recolor.js";
 import { polygonBoolean } from "./bool.js";
 import { icon } from "./icons.js";
@@ -400,6 +404,94 @@ function paint() {
   paintRulers();
 }
 
+function paintCornerWidgets(parts) {
+  const d = doc();
+  if (!d || ui.cornerWidgets === false) return;
+  if (ui.tool !== "selection" && ui.tool !== "directSelection") return;
+  const { map, parent } = indexNodes(d.file);
+  const anyPath = ui.tool === "directSelection";
+  for (const id of d.selection) {
+    const n = map.get(id);
+    const widgets = cornerWidgets(n, d.zoom, anyPath);
+    if (!widgets.length) continue;
+    let layer = n;
+    while (layer && layer.kind?.type !== "layer") layer = parent.get(layer.id);
+    const color = layer ? layerColorCss(layer) : "#4f80ff";
+    for (const w of widgets) {
+      const s = docToScreen(w.at);
+      parts.push(`<circle cx="${s.x}" cy="${s.y}" r="3" fill="#fff" stroke="${color}" stroke-width="1"/>`);
+      parts.push(`<circle cx="${s.x}" cy="${s.y}" r="1" fill="${color}"/>`);
+    }
+  }
+  if (gesture.on && gesture.mode === "corner" && gesture.moved && gesture.corner) {
+    const s = gesture.screen || { x: 12, y: 12 };
+    const u = unitSpec();
+    const r = Math.round(((gesture.corner.radiusNow ?? 0) / u.per) * 100) / 100;
+    parts.push(`<text x="${s.x + 14}" y="${s.y - 10}" fill="#f4f4f4" font-size="11" font-family="Inter, sans-serif">Radius: ${r} ${u.suffix}</text>`);
+  }
+}
+function cornerHit(p) {
+  const d = doc();
+  if (!d || ui.cornerWidgets === false) return null;
+  if (ui.tool !== "selection" && ui.tool !== "directSelection") return null;
+  const { map } = indexNodes(d.file);
+  const nodes = d.selection.map((id) => map.get(id)).filter(Boolean);
+  return hitCornerWidget(nodes, p, d.zoom, ui.tool === "directSelection", 5 / d.zoom);
+}
+function beginCorner(widget, alt) {
+  const d = doc();
+  const { map } = indexNodes(d.file);
+  const anyPath = ui.tool === "directSelection";
+  const targets = d.selection.map((id) => map.get(id)).filter(Boolean).map((n) => {
+    const ws = cornerWidgets(n, d.zoom, anyPath);
+    return ws.length ? { id: n.id, corners: ws.map((w) => w.index) } : null;
+  }).filter(Boolean);
+  gesture.mode = "corner";
+  gesture.moved = false;
+  gesture.alt = alt;
+  gesture.corner = {
+    start: widget.at && gesture.start,
+    radius: widget.fitted,
+    kind: widget.kind,
+    max: widget.max,
+    corner: widget.corner,
+    xf: widget.xf,
+    targets,
+    radiusNow: widget.fitted,
+  };
+  gesture.corner.start = { ...gesture.start };
+}
+function applyCornerRadius(r) {
+  const d = doc();
+  const { map } = indexNodes(d.file);
+  for (const t of gesture.corner?.targets || []) {
+    const n = map.get(t.id);
+    if (n) setLiveCorners(n, { radius: r, corners: t.corners });
+  }
+}
+function openCorners(widget) {
+  const d = doc();
+  if (!d) return;
+  const { map } = indexNodes(d.file);
+  const paths = selectedNodes().filter((n) => n.kind?.type === "path" && liveCorners(n)?.corners.length);
+  const node = widget ? map.get(widget.id) : paths.length === 1 ? paths[0] : null;
+  if (!widget && paths.length !== 1) { toast(paths.length ? "Select one path" : "Corners edits the corners of a path"); return; }
+  const lc = liveCorners(node);
+  if (!node || !lc?.corners.length) { toast("Corners edits the corners of a path"); return; }
+  const corners = widget ? cornerWidgets(node, d.zoom, true).map((w) => w.index) : lc.corners.map((c) => c.index);
+  const picked = corners.length ? corners : lc.corners.map((c) => c.index);
+  const radii = picked.map((i) => lc.radii[i] || 0);
+  const kinds = picked.map((i) => lc.kinds[i] || "round");
+  ui.cornerDialog = {
+    id: node.id,
+    corners: picked,
+    kind: kinds.every((k) => k === kinds[0]) ? kinds[0] : "",
+    radius: radii.every((r) => Math.abs(r - radii[0]) < 1e-6) ? radii[0] : "",
+    kindSet: kinds.every((k) => k === kinds[0]),
+    radiusSet: radii.every((r) => Math.abs(r - radii[0]) < 1e-6),
+  };
+  openModal("corners");
+}
 function paintOverlay() {
   const ov = $("overlay");
   const d = doc();
@@ -437,6 +529,7 @@ function paintOverlay() {
     parts.push(`<line x1="${top.x}" y1="${top.y}" x2="${rot.x}" y2="${rot.y}" stroke="#4f80ff" stroke-width="1"/>`);
     parts.push(`<circle cx="${rot.x}" cy="${rot.y}" r="4" fill="#fff" stroke="#4f80ff"/>`);
   }
+  paintCornerWidgets(parts);
   if (d.selection.length && ui.tool !== "artboard") {
     paintMeshPoints(parts);
     paintBlendSpines(parts);
@@ -1360,6 +1453,17 @@ const commands = {
   },
   editClipContents: () => editClip(false),
   editClipMask: () => editClip(true),
+  corners: () => openCorners(),
+  toggleCornerWidgets: () => { ui.cornerWidgets = ui.cornerWidgets === false; paintOverlay(); },
+  invertPie: () => {
+    const d = doc();
+    const n = selectedNodes().find((node) => node.kind?.live?.shape === "ellipse");
+    if (!d || !n) return;
+    pushHistory();
+    setEllipsePie(n, { invert: true });
+    paint();
+    refreshChrome();
+  },
   expandShape: () => {
     const d = doc();
     if (!d) return;
@@ -2178,6 +2282,16 @@ function onDown(e) {
     return;
   }
 
+  if (tool === "selection" || tool === "directSelection") {
+    const widget = cornerHit(p0);
+    if (widget) {
+      if (e.detail >= 2) { gesture.on = false; return; }
+      beginCorner(widget, e.altKey);
+      gesture.corner.start = { ...p0 };
+      return;
+    }
+  }
+
   if (tool === "selection") {
     const h = handleAt(screen.x, screen.y);
     if (h && d.selection.length) {
@@ -2339,6 +2453,27 @@ function onMove(e) {
     if (!gesture.on) { paintOverlay(); return; }
   }
   if (!gesture.on) return;
+  if (gesture.mode === "corner") {
+    gesture.screen = screen;
+    const travel = Math.hypot(raw.x - gesture.corner.start.x, raw.y - gesture.corner.start.y);
+    if (!gesture.moved) {
+      if (travel < 3 / d.zoom) { paintOverlay(); return; }
+      pushHistory();
+      gesture.moved = true;
+    }
+    const inv = invertXf(gesture.corner.xf);
+    const a = applyXf(inv, gesture.corner.start);
+    const b = applyXf(inv, raw);
+    const local = { x: b.x - a.x, y: b.y - a.y };
+    const max = gesture.corner.max || 0;
+    const r = Math.max(0, Math.min(max, gesture.corner.radius + radiusChange(gesture.corner.corner, local)));
+    gesture.corner.radiusNow = r;
+    gesture.corner.atLimit = max > 0 && r >= max - 1e-9;
+    applyCornerRadius(r);
+    paint();
+    paintOverlay();
+    return;
+  }
   if (gesture.mode === "pan") {
     d.panX += e.movementX;
     d.panY += e.movementY;
@@ -2505,7 +2640,11 @@ function onMove(e) {
     return;
   }
   if (gesture.mode === "anchor") {
-    if (!gesture.moved) { pushHistory(); gesture.moved = true; }
+    if (!gesture.moved) {
+      pushHistory();
+      gesture.moved = true;
+      if (gesture.anchor?.which === "p" && gesture.anchor.node.kind?.live) delete gesture.anchor.node.kind.live;
+    }
     const a = gesture.anchor;
     const an = a.node.kind.path.subpaths[a.si].anchors[a.ai];
     const dx = p.x - an[a.which].x, dy = p.y - an[a.which].y;
@@ -2545,6 +2684,22 @@ function onUp(e) {
   $("canvas").classList.remove("panning");
   ui.guides = null;
   if (!d) return;
+  if (mode === "corner") {
+    if (!gesture.moved && gesture.alt) {
+      pushHistory();
+      const { map } = indexNodes(d.file);
+      const kind = nextCornerKind(gesture.corner?.kind);
+      for (const t of gesture.corner?.targets || []) {
+        const n = map.get(t.id);
+        if (n) setLiveCorners(n, { kind, corners: t.corners });
+      }
+      paint();
+    }
+    gesture.corner = null;
+    refreshChrome();
+    paintOverlay();
+    return;
+  }
   if (mode === "artboard") { gesture.abHist = false; gesture.abNodes = null; refreshChrome(); paintOverlay(); return; }
   if (mode === "perspGrid" || mode === "perspPlane" || mode === "perspMove" || mode === "perspScale") {
     gesture.gridHist = false;
@@ -2844,8 +2999,18 @@ function shapePath(p, shift, alt) {
   if (tool === "lineSegment") return linePath(gesture.start.x, gesture.start.y, p.x, p.y);
   return null;
 }
+function liveDrawnShape(p, shift, alt) {
+  let x0 = gesture.start.x, y0 = gesture.start.y, x1 = p.x, y1 = p.y;
+  if (alt) { x0 = gesture.start.x - (x1 - gesture.start.x); y0 = gesture.start.y - (y1 - gesture.start.y); }
+  let w = x1 - x0, h = y1 - y0;
+  if (shift && gesture.tool !== "lineSegment") {
+    const s = Math.max(Math.abs(w), Math.abs(h));
+    w = Math.sign(w || 1) * s; h = Math.sign(h || 1) * s;
+  }
+  return liveShapeSpec(gesture.tool, x0, y0, w, h, gesture.sides || 6);
+}
 function previewShape(p, shift, alt) {
-  const path = shapePath(p, shift, alt);
+  const path = liveDrawnShape(p, shift, alt)?.path || shapePath(p, shift, alt);
   const g = $("art").querySelector("#live-preview");
   if (!g || !path) return;
   const fill = ui.fill?.type === "solid" ? rgbCss(ui.fill.color) : "none";
@@ -2853,7 +3018,8 @@ function previewShape(p, shift, alt) {
   g.innerHTML = `<path d="${pathD(path)}" fill="${fill}" stroke="${stroke}" stroke-width="${ui.strokeWidth}"/>`;
 }
 function commitShape(p, shift, alt) {
-  const path = shapePath(p, shift, alt);
+  const made = liveDrawnShape(p, shift, alt);
+  const path = made?.path || shapePath(p, shift, alt);
   const g = $("art").querySelector("#live-preview");
   if (g) g.innerHTML = "";
   if (!path) return;
@@ -2862,7 +3028,7 @@ function commitShape(p, shift, alt) {
   const d = doc();
   pushHistory();
   const names = { rectangle: "Rectangle", roundedRectangle: "Rounded Rectangle", ellipse: "Ellipse", polygon: "Polygon", star: "Star", lineSegment: "Line" };
-  const node = makePathNode(d.file, path, { ...styleNow(), name: names[gesture.tool] || "Path" });
+  const node = makePathNode(d.file, path, { ...styleNow(), name: made?.name || names[gesture.tool] || "Path", live: made?.live });
   if (gesture.tool === "lineSegment") setPaint(node, "fill", nonePaint());
   placeArt(d.file, node);
   d.selection = [node.id];
@@ -3337,7 +3503,10 @@ function menuItems(name) {
         { label: "Exclude", cmd: "pathfinderExclude" },
       ] },
       { sep: true },
-      { label: "Expand Shape", cmd: "expandShape" },
+      { label: "Shape", items: [
+        { label: "Corners…", cmd: "corners" },
+        { label: "Expand Shape", cmd: "expandShape" },
+      ] },
       { label: "Create Gradient Mesh…", cmd: "createMesh" },
     ],
     Type: [
@@ -3379,6 +3548,7 @@ function menuItems(name) {
       { label: ((readGrid(file()) && readGrid(file()).visible !== false) ? "✓ " : "") + "Perspective Grid", cmd: "togglePerspective" },
       { label: (ui.snap ? "✓ " : "") + "Snap", cmd: "toggleSnap" },
       { label: (ui.control ? "✓ " : "") + "Control Bar", cmd: "toggleControl" },
+      { label: (ui.cornerWidgets === false ? "" : "✓ ") + "Corner Widgets", cmd: "toggleCornerWidgets" },
     ],
     Window: [
       ...RAIL.map((r) => ({ label: r.label, run: () => { ui.panel = r.id; ui.panels = true; $("dock").style.display = ""; drawPanel(); } })),
@@ -4000,6 +4170,7 @@ function propertiesHTML(n, nodes) {
       <button class="mini" data-flip="h" title="Flip Horizontal">${icon("flipH", 14)}</button>
       <button class="mini" data-flip="v" title="Flip Vertical">${icon("flipV", 14)}</button>
     </div>
+    ${shapePropsHTML(n)}
   </div>
   ${text ? `<div class="psec"><h3>Character</h3>
     <select class="full" data-field="family">${["Source Sans 3", "Source Serif 4", "Inter", "JetBrains Mono"].map((f) => `<option ${text.font_family === f ? "selected" : ""}>${f}</option>`).join("")}</select>
@@ -4048,8 +4219,38 @@ function propertiesHTML(n, nodes) {
     </div>
   </div>`;
 }
+function shapePropsHTML(n) {
+  const live = n.kind?.type === "path" ? n.kind.live : null;
+  if (!live || live.shape === "path" || live.shape === "star") {
+    const lc = liveCorners(n);
+    return lc?.corners.length ? `<div class="row" style="margin-top:6px"><button class="btn" data-cmd="corners">Corners…</button></div>` : "";
+  }
+  const u = unitSpec();
+  if (live.shape === "rectangle") {
+    const radii = live.radii || [0, 0, 0, 0];
+    const same = radii.every((r) => Math.abs(r - radii[0]) < 1e-6);
+    return `<h3 style="margin-top:10px">Rectangle</h3>
+      <div class="row">${numField("Radius", same ? radii[0] / u.per : "", "radius", u.suffix)}</div>
+      <button class="btn" data-cmd="corners">Corners…</button>`;
+  }
+  if (live.shape === "ellipse") {
+    const pie = live.pie || [0, 360];
+    return `<h3 style="margin-top:10px">Ellipse</h3>
+      <div class="grid2">${numField("Start", pie[0], "pieStart", "°")}${numField("End", pie[1], "pieEnd", "°")}</div>
+      <button class="btn" data-cmd="invertPie">Invert Pie</button>`;
+  }
+  if (live.shape === "polygon") {
+    const radii = live.radii || [];
+    const same = !radii.length || radii.every((r) => Math.abs(r - radii[0]) < 1e-6);
+    return `<h3 style="margin-top:10px">Polygon</h3>
+      <div class="grid2">${numField("Sides", live.sides || 3, "sides")}${numField("Radius", same ? (radii[0] || 0) / u.per : "", "radius", u.suffix)}</div>
+      <button class="btn" data-cmd="corners">Corners…</button>`;
+  }
+  return "";
+}
 function numField(label, value, field, unit) {
-  const v = Math.round((+value || 0) * 1000) / 1000;
+  const blank = value === "" || value == null;
+  const v = blank ? "" : Math.round((+value || 0) * 1000) / 1000;
   return `<div class="field">${label ? `<label>${label}</label>` : ""}<input data-field="${field}" type="number" step="0.1" value="${v}"/>${unit ? `<span class="unit">${unit}</span>` : ""}</div>`;
 }
 function refPointHTML() {
@@ -4298,6 +4499,25 @@ function commitField(field, value, live) {
     paint(); return;
   }
   if (field === "angle") { setGradient(+value, { x: 0, y: 0 }, { x: 1, y: 0 }, false); paint(); return; }
+  if (field === "radius") {
+    const v = Math.max(0, (+value || 0) * unitSpec().per);
+    for (const n of nodes) if (n.kind?.type === "path") setLiveCorners(n, { radius: v });
+    paint();
+    refreshChrome();
+    return;
+  }
+  if (field === "pieStart" || field === "pieEnd") {
+    const key = field === "pieStart" ? "start" : "end";
+    for (const n of nodes) setEllipsePie(n, { [key]: +value || 0 });
+    paint();
+    return;
+  }
+  if (field === "sides") {
+    for (const n of nodes) setPolygonSides(n, +value || 3);
+    paint();
+    refreshChrome();
+    return;
+  }
   if (field === "rot") {
     const b = selectionBounds(d.file, d.selection);
     if (!b) return;
@@ -4516,6 +4736,16 @@ function openModal(kind) {
       <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="bl-ok">OK</button></div>`;
     back.dataset.blend = "1";
   }
+  else if (kind === "corners") {
+    const f = ui.cornerDialog || { kind: "round", radius: 0, kindSet: true, radiusSet: true };
+    const kinds = [["round", "Round"], ["invertedRound", "Inverted Round"], ["chamfer", "Chamfer"]];
+    inner = `<h2>Corners</h2>
+      <div class="row"><label style="width:70px;color:var(--text-dim)">Corner</label><div>
+        ${kinds.map(([id, label]) => `<label class="row"><input type="radio" name="ckind" value="${id}" ${f.kind === id ? "checked" : ""}/> ${label}</label>`).join("")}
+      </div></div>
+      <div class="row"><label style="width:70px;color:var(--text-dim)">Radius</label><input class="full" id="cr-radius" type="number" min="0" step="0.1" value="${f.radius === "" ? "" : Math.round((+f.radius || 0) * 1000) / 1000}"/> <span class="unit">pt</span></div>
+      <div class="actions"><button class="btn" data-x>Cancel</button><button class="btn primary" id="cr-ok">OK</button></div>`;
+  }
   else if (kind === "recolor") {
     inner = `<h2>Recolor Artwork</h2>
       <p class="hint">Current colours take the new colour by the method. White and black stay unless you clear Preserve.</p>
@@ -4605,6 +4835,26 @@ function openModal(kind) {
     const f = newFile({ title: back.querySelector("#nd-name").value || "Untitled", width: w, height: h, colorMode: back.querySelector("#nd-mode").value });
     openDoc(f, f.document.title);
     back.remove();
+  });
+  back.querySelector("#cr-ok")?.addEventListener("click", () => {
+    const f = ui.cornerDialog;
+    const d = doc();
+    if (!f || !d) { closePops(); return; }
+    const { map } = indexNodes(d.file);
+    const n = map.get(f.id);
+    if (!n) { closePops(); return; }
+    const kindEl = back.querySelector("input[name=ckind]:checked");
+    const radiusEl = back.querySelector("#cr-radius");
+    const patch = { corners: f.corners };
+    if (kindEl) patch.kind = kindEl.value;
+    if (radiusEl && radiusEl.value !== "") patch.radius = Math.max(0, (+radiusEl.value || 0) * unitSpec().per);
+    if (patch.kind || patch.radius != null) {
+      pushHistory();
+      setLiveCorners(n, patch);
+      paint();
+      refreshChrome();
+    }
+    closePops();
   });
   back.querySelector("#pf-ok")?.addEventListener("click", () => {
     setTheme(back.querySelector("#pf-theme").value);
@@ -4845,6 +5095,8 @@ function boot() {
   }, { passive: false });
   canvas.addEventListener("dblclick", (e) => {
     if (ui.tool === "zoom") fit("all");
+    const widget = cornerHit(screenToDoc(local(e).x, local(e).y));
+    if (widget && (ui.tool === "selection" || ui.tool === "directSelection")) { openCorners(widget); return; }
     if (ui.tool === "selection") {
       const hit = hitAt(screenToDoc(local(e).x, local(e).y), true);
       if (hit?.kind?.type === "text") { doc().selection = [hit.id]; beginTextEdit(hit); }

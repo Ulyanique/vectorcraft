@@ -4,7 +4,8 @@ import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
 import { addSpineAnchor, blendSpine, moveSpineAnchor, readBlendOptions, removeSpineAnchor, stepsBetween, writeBlendOptions } from "./blend.js";
 import { applyRecolor, artworkColors, cluster, colorFromKey, colorKey, keepsNeutral, mapColor, neutralOf, reduceColors, tinted } from "./recolor.js";
 import { clipEditTargets, loadFile, makeClippingMask, releaseClippingMask } from "./model.js";
-import { ellipsePath, pathD, toRgb, warpDocPoint } from "./geom.js";
+import { ellipsePath, pathD, starPath, toRgb, warpDocPoint } from "./geom.js";
+import { liveCorners, maxRadius, pathCorners, setEllipsePie, setLiveCorners, setPolygonSides } from "./corners.js";
 import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
 import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
 
@@ -231,6 +232,45 @@ if (clipped.body.includes("rgb(0, 255, 0)") || clipped.body.includes("#00ff00"))
 if (!releaseClippingMask(clipFile, [10])) throw new Error("release");
 if (clipGroup.kind.clip || clipGroup.kind.children[0].kind.clipping) throw new Error("release should stop clipping");
 console.log("clipping mask", made.id);
+
+const square = {
+  id: 1, visible: true,
+  kind: {
+    type: "path",
+    path: { subpaths: [{ closed: true, anchors: [
+      { p: { x: 0, y: 0 }, in: { x: 0, y: 0 }, out: { x: 0, y: 0 }, kind: "Corner" },
+      { p: { x: 100, y: 0 }, in: { x: 100, y: 0 }, out: { x: 100, y: 0 }, kind: "Corner" },
+      { p: { x: 100, y: 80 }, in: { x: 100, y: 80 }, out: { x: 100, y: 80 }, kind: "Corner" },
+      { p: { x: 0, y: 80 }, in: { x: 0, y: 80 }, out: { x: 0, y: 80 }, kind: "Corner" },
+    ] }] },
+    live: { shape: "rectangle", w: 100, h: 80, radii: [0, 0, 0, 0], xf: [1, 0, 0, 1, 0, 0] },
+  },
+};
+if (pathCorners(square.kind.path).length !== 4) throw new Error("rectangle should have 4 corners");
+if (Math.abs(maxRadius(pathCorners(square.kind.path)[0]) - 40) > 1e-6) throw new Error("corner max is half the shorter side");
+setLiveCorners(square, { radius: 10, corners: [1] });
+const cut = square.kind.path.subpaths[0].anchors;
+if (cut.length !== 5) throw new Error("one rounded corner is two anchors, got " + cut.length);
+if (liveCorners(square).sources[0].join() !== "0,1,1,2,3") throw new Error("corner sources " + liveCorners(square).sources[0]);
+const end = cut[1];
+if (Math.abs(end.p.x - 90) > 1e-6 || Math.abs(end.p.y) > 1e-6) throw new Error("top-right cut should meet the top at 90,0: " + JSON.stringify(end.p));
+setLiveCorners(square, { kind: "chamfer", corners: [1] });
+const chamfer = square.kind.path.subpaths[0].anchors[1];
+if (Math.abs(chamfer.in.x - chamfer.p.x) > 1e-6 || Math.abs(chamfer.in.y - chamfer.p.y) > 1e-6) throw new Error("chamfer is straight");
+const star = { id: 2, visible: true, kind: { type: "path", path: starPath(100, 100, 50, 5, 0.5) } };
+if (pathCorners(star.kind.path).length !== 10) throw new Error("star corners");
+setLiveCorners(star, { radius: 4 });
+if (star.kind.live?.shape !== "path" || star.kind.path.subpaths[0].anchors.length !== 20) throw new Error("star cuts to 20 anchors");
+setLiveCorners(star, { radius: 0 });
+if (star.kind.live) throw new Error("a path with no cut corners is plain again");
+const pie = { id: 3, visible: true, kind: { type: "path", path: ellipsePath(50, 50, 40, 20), live: { shape: "ellipse", w: 80, h: 40, pie: [0, 360], xf: [1, 0, 0, 1, 10, 30] } } };
+setEllipsePie(pie, { end: 90 });
+if (pie.kind.path.subpaths[0].anchors.length !== 3) throw new Error("quarter pie");
+if (Math.abs(pie.kind.path.subpaths[0].anchors[0].p.x - 50) > 1e-6) throw new Error("pie centre follows xf");
+const poly = { id: 4, visible: true, kind: { type: "path", path: { subpaths: [] }, live: { shape: "polygon", radius: 30, sides: 6, xf: [1, 0, 0, 1, 0, 0] } } };
+setPolygonSides(poly, 5);
+if (poly.kind.path.subpaths[0].anchors.length !== 5) throw new Error("polygon sides");
+console.log("corners", "rect", cut.length, "star plain", star.kind.path.subpaths[0].anchors.length);
 
 const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
 const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];

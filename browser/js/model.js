@@ -267,7 +267,7 @@ export function objectLabel(node) {
   const t = node.kind?.type;
   if (t === "path") {
     const live = node.kind.live?.shape;
-    if (live === "rectangle") return "Rectangle";
+    if (live === "rectangle") return (node.kind.live.radii || []).some((r) => r > 0) ? "Rounded Rectangle" : "Rectangle";
     if (live === "ellipse") return "Ellipse";
     if (live === "polygon") return "Polygon";
     if (live === "star") return "Star";
