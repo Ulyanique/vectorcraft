@@ -1,0 +1,512 @@
+import { readFileSync } from "node:fs";
+import { polygonBoolean } from "./bool.js";
+import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
+import { addSpineAnchor, blendSpine, moveSpineAnchor, readBlendOptions, removeSpineAnchor, stepsBetween, writeBlendOptions } from "./blend.js";
+import { applyRecolor, artworkColors, cluster, colorFromKey, colorKey, keepsNeutral, mapColor, neutralOf, reduceColors, tinted } from "./recolor.js";
+import { addToLayer, clipEditTargets, expandRepeat, joinPaths, loadFile, makeClippingMask, makeCompoundPath, makePathNode, makeRect, makeRepeat, newFile, nodeBounds, outlineStrokes, readRepeatOptions, releaseClippingMask, releaseCompoundPath, releaseRepeat, reversePathDirections, transformNode, writeRepeatOptions } from "./model.js";
+import { ellipsePath, hitFill, linePath, pathD, pathFromAnchors, starPath, strokeOutline, subpathSignedArea, toRgb, warpDocPoint } from "./geom.js";
+import { liveCorners, maxRadius, pathCorners, setEllipsePie, setLiveCorners, setPolygonSides } from "./corners.js";
+import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
+import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
+
+const gray = toRgb({ model: "gray", k: 0.9 });
+if (Math.abs(gray.r - 0.1) > 1e-6) throw new Error("gray ink should be 1-k, got " + gray.r);
+
+const rect = { subpaths: [{ closed: true, anchors: [
+  { p: { x: 0, y: 0 }, in: { x: 0, y: 0 }, out: { x: 0, y: 0 }, kind: "Corner" },
+  { p: { x: 100, y: 0 }, in: { x: 100, y: 0 }, out: { x: 100, y: 0 }, kind: "Corner" },
+  { p: { x: 100, y: 100 }, in: { x: 100, y: 100 }, out: { x: 100, y: 100 }, kind: "Corner" },
+  { p: { x: 0, y: 100 }, in: { x: 0, y: 100 }, out: { x: 0, y: 100 }, kind: "Corner" },
+] }] };
+const mesh = meshFromPath(rect, { rows: 2, cols: 2, color: { model: "rgb", r: 1, g: 0, b: 0 }, appearance: "center", highlight: 100 });
+if (!mesh || mesh.rows !== 2 || mesh.points.length !== 9) throw new Error("mesh grid");
+const corner = mesh.points[0];
+if (Math.hypot(corner.p.x, corner.p.y) > 1e-4) throw new Error("mesh corner " + JSON.stringify(corner.p));
+const mid = mesh.points[1 * 3 + 1];
+if (Math.abs(mid.p.x - 50) > 1e-3 || Math.abs(mid.p.y - 50) > 1e-3) throw new Error("mesh centre " + JSON.stringify(mid.p));
+if (mid.color.r < 0.99 || mid.color.g < 0.99) throw new Error("center highlight " + JSON.stringify(mid.color));
+if (corner.color.r < 0.99 || corner.color.g > 0.01) throw new Error("corner stays red " + JSON.stringify(corner.color));
+const disk = meshFromPath(ellipsePath(50, 50, 40, 40), { rows: 2, cols: 2, appearance: "flat" });
+const hub = disk.points[1 * 3 + 1].p;
+if (Math.hypot(hub.x - 50, hub.y - 50) > 2) throw new Error("circle mesh centre " + JSON.stringify(hub));
+console.log("mesh", mesh.points.length, "circle hub", hub.x.toFixed(2), hub.y.toFixed(2));
+
+const meshGrid = meshFromPath(rect, { rows: 1, cols: 1, appearance: "flat", color: { model: "rgb", r: 0, g: 0, b: 1 } });
+const rightHandle = meshGrid.points[1].handles[0].x;
+moveMeshPoint(meshGrid, 1, 130, -20);
+if (meshGrid.points[1].p.x !== 130 || meshGrid.points[1].p.y !== -20) throw new Error("mesh point did not move");
+if (Math.abs(meshGrid.points[1].handles[0].x - rightHandle) > 1e-6) throw new Error("moving a point should keep handle offsets");
+moveMeshPoint(meshGrid, 1, 150, -20, 2);
+if (Math.abs(meshGrid.points[1].p.x - 130) > 1e-6) throw new Error("handle drag moved the point");
+if (Math.abs(meshGrid.points[1].handles[2].x - 20) > 1e-6 || Math.abs(meshGrid.points[1].handles[2].y) > 1e-6) throw new Error("handle offset " + JSON.stringify(meshGrid.points[1].handles[2]));
+const editable = meshFromPath(rect, { rows: 1, cols: 1, appearance: "flat" });
+if (pointNear(editable, { x: 0, y: 0 }, 1) !== 0) throw new Error("pointNear missed the corner");
+if (locateMesh(editable, { x: -10, y: 50 }) != null) throw new Error("locateMesh should reject a point outside the outline");
+const added = addLinesAt(editable, { x: 50, y: 50 });
+if (editable.rows !== 2 || editable.cols !== 2 || editable.points.length !== 9) throw new Error("addLinesAt grid " + editable.rows + "x" + editable.cols);
+const hub2 = editable.points[added];
+if (Math.hypot(hub2.p.x - 50, hub2.p.y - 50) > 1) throw new Error("added mesh point " + JSON.stringify(hub2.p));
+const lines = pathD(meshLinesPath(editable));
+if ((lines.match(/[MC]/g) || []).length < 12) throw new Error("mesh lines missing: " + lines.slice(0, 80));
+if (!removePointLines(editable, added)) throw new Error("interior point should delete its lines");
+if (editable.rows !== 1 || editable.cols !== 1 || editable.points.length !== 4) throw new Error("deletePoint left " + editable.points.length);
+if (removePointLines(editable, 0)) throw new Error("a corner point has no interior line to delete");
+console.log("mesh edit", added, "lines", lines.length);
+
+function rectNode(x) {
+  const corner = (px, py) => ({ p: { x: px, y: py }, in: { x: px, y: py }, out: { x: px, y: py }, kind: "Corner" });
+  return {
+    id: x + 1, visible: true, opacity: 1, appearance: { items: [] },
+    kind: { type: "path", path: { subpaths: [{ closed: true, anchors: [corner(x, 0), corner(x + 10, 0), corner(x + 10, 10), corner(x, 10)] }] } },
+  };
+}
+const keys = [rectNode(0), rectNode(100)];
+const straight = expandBlend({ kind: { type: "blend", spec: { spacing: { steps: 1 } }, children: keys } });
+const straightMid = straight[1].kind.path.subpaths[0].anchors.reduce((s, a) => ({ x: s.x + a.p.x, y: s.y + a.p.y }), { x: 0, y: 0 });
+straightMid.x /= 4; straightMid.y /= 4;
+if (Math.hypot(straightMid.x - 55, straightMid.y - 5) > 1e-6) throw new Error("straight blend mid " + JSON.stringify(straightMid));
+const spine = { subpaths: [{ closed: false, anchors: [
+  { p: { x: 5, y: 5 }, in: { x: 5, y: 5 }, out: { x: 5, y: 5 }, kind: "Corner" },
+  { p: { x: 55, y: -95 }, in: { x: 55, y: -95 }, out: { x: 55, y: -95 }, kind: "Corner" },
+  { p: { x: 105, y: 5 }, in: { x: 105, y: 5 }, out: { x: 105, y: 5 }, kind: "Corner" },
+] }] };
+const bent = expandBlend({ kind: { type: "blend", spec: { spacing: { steps: 1 }, spine, keyAnchors: [0, 2] }, children: keys } });
+const bentMid = bent[1].kind.path.subpaths[0].anchors.reduce((s, a) => ({ x: s.x + a.p.x, y: s.y + a.p.y }), { x: 0, y: 0 });
+bentMid.x /= 4; bentMid.y /= 4;
+if (Math.hypot(bentMid.x - 55, bentMid.y + 95) > 1e-4) throw new Error("bent spine mid " + JSON.stringify(bentMid));
+if (Math.hypot(bent[0].kind.path.subpaths[0].anchors[0].p.x - 0, bent[0].kind.path.subpaths[0].anchors[0].p.y) > 1e-6) throw new Error("key moved with the spine");
+const live = blendSpine(keys, {});
+if (live.anchors.join() !== "0,1" || Math.hypot(live.path.subpaths[0].anchors[0].p.x - 5, live.path.subpaths[0].anchors[0].p.y - 5) > 1e-6) {
+  throw new Error("default spine " + JSON.stringify(live.path.subpaths[0].anchors.map((a) => a.p)));
+}
+const spineBlend = { kind: { type: "blend", spec: { spacing: { steps: 1 } }, children: [rectNode(0), rectNode(100)] } };
+const inserted = addSpineAnchor(spineBlend, 55, 5);
+if (inserted !== 1 || spineBlend.kind.spec.keyAnchors.join() !== "0,2") throw new Error("add spine point " + inserted + " " + spineBlend.kind.spec.keyAnchors);
+if (!moveSpineAnchor(spineBlend, 1, 55, -95)) throw new Error("move spine point");
+if (removeSpineAnchor(spineBlend, 0)) throw new Error("a key's spine point should stay");
+const followed = expandBlend(spineBlend);
+const followedMid = followed[1].kind.path.subpaths[0].anchors.reduce((s, a) => ({ x: s.x + a.p.x, y: s.y + a.p.y }), { x: 0, y: 0 });
+followedMid.x /= 4; followedMid.y /= 4;
+if (Math.hypot(followedMid.x - 55, followedMid.y + 95) > 1e-4) throw new Error("edited spine mid " + JSON.stringify(followedMid));
+console.log("blend spine", inserted, "mid", followedMid.y.toFixed(2));
+
+function painted(x, color) {
+  const n = rectNode(x);
+  n.appearance = { items: [{ kind: "fill", visible: true, paint: { type: "solid", color } }] };
+  return n;
+}
+const red = painted(0, { model: "rgb", r: 1, g: 0, b: 0 });
+const blue = painted(100, { model: "rgb", r: 0, g: 0, b: 1 });
+if (stepsBetween([red, blue], { spacing: "smoothColor" }, 0) !== 128) throw new Error("smooth color steps");
+if (stepsBetween([rectNode(0), rectNode(100)], { spacing: "smoothColor" }, 0) !== 50) throw new Error("same-color steps");
+if (stepsBetween([rectNode(0), rectNode(100)], { spacing: { distance: 25 } }, 0) !== 3) throw new Error("distance steps");
+if (stepsBetween([rectNode(0), rectNode(100)], { spacing: { steps: 70 } }, 0) !== 70) throw new Error("specified steps");
+const opt = {};
+writeBlendOptions(opt, { spacing: "distance", distance: 12, orientation: "path" });
+if (opt.spacing.distance !== 12 || opt.orientation !== "alignToPath") throw new Error("write blend options " + JSON.stringify(opt));
+const read = readBlendOptions(opt);
+if (read.spacing !== "distance" || read.orientation !== "path" || read.distance !== 12) throw new Error("read blend options " + JSON.stringify(read));
+function stacked(y) {
+  const n = rectNode(0);
+  n.kind.path.subpaths[0].anchors.forEach((a) => { a.p.y += y; a.in.y += y; a.out.y += y; });
+  return n;
+}
+const upright = expandBlend({
+  kind: {
+    type: "blend",
+    spec: {
+      spacing: { steps: 1 },
+      orientation: "alignToPath",
+      keyAnchors: [0, 1],
+      spine: { subpaths: [{ closed: false, anchors: [
+        { p: { x: 5, y: 5 }, in: { x: 5, y: 5 }, out: { x: 5, y: 5 }, kind: "Corner" },
+        { p: { x: 5, y: 105 }, in: { x: 5, y: 105 }, out: { x: 5, y: 105 }, kind: "Corner" },
+      ] }] },
+    },
+    children: [stacked(0), stacked(100)],
+  },
+});
+const turned = upright[1].kind.path.subpaths[0].anchors[0].p;
+if (Math.abs(turned.x - 10) > 1e-3 || Math.abs(turned.y - 50) > 1e-3) throw new Error("align to path " + JSON.stringify(turned));
+console.log("blend options", read.spacing, "turned", turned.x.toFixed(2), turned.y.toFixed(2));
+
+function closeColor(a, b) {
+  if (a.model !== b.model) return false;
+  const keys = a.model === "cmyk" ? ["c", "m", "y", "k"] : a.model === "gray" ? ["k"] : a.model === "lab" ? ["l", "a", "b"] : ["r", "g", "b"];
+  return keys.every((k) => Math.abs((a[k] ?? 0) - (b[k] ?? 0)) < (a.model === "lab" ? 0.1 : 1e-3));
+}
+if (colorKey({ model: "rgb", r: 1, g: 0.5, b: 0 }) !== "rgb 255 127.5 0") throw new Error("rgb key");
+if (colorKey({ model: "cmyk", c: 0, m: 1, y: 1, k: 0 }) !== "cmyk 0 100 100 0") throw new Error("cmyk key");
+if (colorKey({ model: "gray", k: 0.4 }) !== "gray 40") throw new Error("gray key");
+if (colorKey({ model: "lab", l: 55, a: 60.5, b: -40.25 }) !== "lab 55 60.5 -40.25") throw new Error("lab key");
+if (colorKey(colorFromKey("rgb 18 52 86")) !== "rgb 18 52 86") throw new Error("key round trip");
+if (colorKey({ model: "cmyk", c: 0, m: 1, y: 1, k: 0 }) === colorKey({ model: "rgb", r: 1, g: 0, b: 0 })) throw new Error("cmyk red is not rgb red");
+const inkRed = { model: "cmyk", c: 0, m: 1, y: 1, k: 0 };
+const pink = tinted(inkRed, 0.4);
+const scaled = mapColor("scaleTints", [pink, inkRed], { model: "cmyk", c: 1, m: 0.5, y: 0, k: 0 }, pink);
+if (!closeColor(scaled, { model: "cmyk", c: 0.4, m: 0.2, y: 0, k: 0 })) throw new Error("scale tints " + JSON.stringify(scaled));
+const other = { model: "cmyk", c: 0, m: 0.3, y: 0.8, k: 0 };
+const kept = mapColor("preserveTints", [inkRed, tinted(inkRed, 0.5), other], { model: "cmyk", c: 1, m: 0, y: 0, k: 0 }, other);
+if (!closeColor(kept, { model: "cmyk", c: 1, m: 0, y: 0, k: 0 })) throw new Error("preserve tints should leave a non-tint exact");
+const hueRow = [{ model: "rgb", r: 0.9, g: 0.2, b: 0.2 }, { model: "rgb", r: 0.5, g: 0.1, b: 0.1 }, { model: "rgb", r: 1, g: 0.7, b: 0.7 }];
+const hueTo = { model: "rgb", r: 0, g: 0.4, b: 1 };
+if (!hueRow.every((c) => closeColor(mapColor("exact", hueRow, hueTo, c), hueTo))) throw new Error("exact");
+const grayMapped = mapColor("exact", [{ model: "gray", k: 0.3 }], hueTo, { model: "gray", k: 0.3 });
+if (grayMapped.model !== "gray") throw new Error("exact should keep gray");
+const colors = [
+  { model: "rgb", r: 1, g: 0, b: 0 },
+  { model: "rgb", r: 0, g: 0, b: 1 },
+  { model: "rgb", r: 0.9, g: 0.1, b: 0.05 },
+  { model: "rgb", r: 0.1, g: 0.1, b: 0.9 },
+  { model: "rgb", r: 1, g: 0.2, b: 0.2 },
+];
+const rows = cluster(colors, [5, 4, 1, 1, 1], 2).map((r) => r.join(","));
+if (rows.join("|") !== "0,2,4|1,3") throw new Error("cluster " + rows.join("|"));
+if (neutralOf({ model: "rgb", r: 1, g: 1, b: 1 }) !== "white" || !keepsNeutral({ model: "rgb", r: 0, g: 0, b: 0 })) throw new Error("preserve black and white");
+const art = {
+  id: 1,
+  appearance: { items: [{ kind: "fill", paint: { type: "solid", color: { model: "rgb", r: 1, g: 0, b: 0 } } }] },
+  kind: { type: "group", children: [{
+    id: 2,
+    appearance: { items: [] },
+    kind: { type: "mesh", rows: 1, cols: 1, points: [{ p: { x: 0, y: 0 }, color: { model: "rgb", r: 0, g: 0, b: 1 } }] },
+  }] },
+};
+if (artworkColors([art]).length !== 2) throw new Error("artwork colors");
+const reduced = reduceColors(artworkColors([art]), { count: 1, method: "exact", preserve: { white: false, black: false, grays: false } });
+if (reduced.map.length !== 1 || reduced.map[0].from.length !== 2) throw new Error("reduce to one row");
+applyRecolor([art], [{ from: [{ model: "rgb", r: 1, g: 0, b: 0 }], to: { model: "rgb", r: 0, g: 1, b: 0 } }, { from: [{ model: "rgb", r: 0, g: 0, b: 1 }], to: hueTo, exclude: true }], "exact");
+if (art.appearance.items[0].paint.color.g !== 1) throw new Error("fill was not recolored");
+if (art.kind.children[0].kind.points[0].color.b !== 1) throw new Error("excluded mesh colour changed");
+const grad = {
+  id: 3,
+  appearance: { items: [{ kind: "fill", paint: { type: "gradient", gradient: { stops: [
+    { offset: 0, color: { model: "rgb", r: 1, g: 0, b: 0 } },
+    { offset: 1, color: { model: "rgb", r: 0, g: 0, b: 1 } },
+  ] } } }] },
+  kind: { type: "text", runs: [{ style: { fill: { type: "solid", color: { model: "rgb", r: 1, g: 1, b: 0 } }, stroke: { type: "none" } } }] },
+};
+applyRecolor([grad], [
+  { from: [{ model: "rgb", r: 1, g: 0, b: 0 }, { model: "rgb", r: 0, g: 0, b: 1 }], to: { model: "rgb", r: 0, g: 1, b: 0 } },
+  { from: [{ model: "rgb", r: 1, g: 1, b: 0 }], to: { model: "rgb", r: 0, g: 0, b: 0 } },
+], "exact");
+const stops = grad.appearance.items[0].paint.gradient.stops;
+if (stops[0].color.g !== 1 || stops[1].color.g !== 1) throw new Error("gradient stops were not recolored");
+if (grad.kind.runs[0].style.fill.color.r !== 0) throw new Error("text fill was not recolored");
+console.log("recolor", rows.join("|"));
+
+function filledRect(id, x, y, w, h, color) {
+  const corner = (px, py) => ({ p: { x: px, y: py }, in: { x: px, y: py }, out: { x: px, y: py }, kind: "Corner" });
+  return {
+    id, visible: true, opacity: 1,
+    appearance: { items: [{ kind: "fill", paint: { type: "solid", color }, opacity: 1, visible: true }] },
+    kind: { type: "path", path: { subpaths: [{ closed: true, anchors: [corner(x, y), corner(x + w, y), corner(x + w, y + h), corner(x, y + h)] }] }, rule: "NonZero", clipping: false, guide: false },
+  };
+}
+const clipFile = {
+  document: {
+    next_id: 10,
+    artboards: [{ id: 1, rect: { x0: 0, y0: 0, x1: 200, y1: 200 } }],
+    layers: [{ id: 1, kind: { type: "layer", children: [
+      filledRect(2, 0, 0, 30, 30, { model: "rgb", r: 0, g: 0, b: 1 }),
+      filledRect(3, 0, 0, 80, 80, { model: "rgb", r: 1, g: 0, b: 0 }),
+      filledRect(4, 40, 40, 20, 20, { model: "rgb", r: 0, g: 1, b: 0 }),
+    ] } }],
+  },
+};
+const refused = makeClippingMask(clipFile, [3]);
+if (!refused.error || clipFile.document.layers[0].kind.children.length !== 3) throw new Error("clip needs two objects");
+const made = makeClippingMask(clipFile, [2, 4]);
+if (made.error || made.id !== 10) throw new Error("make clip " + JSON.stringify(made));
+const layerKids = clipFile.document.layers[0].kind.children;
+if (layerKids.map((n) => n.id).join() !== "3,10") throw new Error("clip group should replace the top object: " + layerKids.map((n) => n.id));
+const clipGroup = layerKids[1];
+if (!clipGroup.kind.clip || clipGroup.kind.children.map((n) => n.id).join() !== "4,2") throw new Error("mask first " + clipGroup.kind.children.map((n) => n.id));
+if (clipGroup.kind.children[0].kind.clipping !== true) throw new Error("mask should clip");
+if (clipGroup.kind.children[0].appearance.items[0].paint.type !== "none") throw new Error("mask paint should be cleared");
+if (clipEditTargets(clipFile, [10], true).join() !== "4") throw new Error("edit mask");
+if (clipEditTargets(clipFile, [2], false).join() !== "2") throw new Error("edit contents from a child");
+const clipped = renderDocument(clipFile);
+if (!clipped.defs.includes("<clipPath") || !clipped.body.includes("clip-path=")) throw new Error("svg clip missing");
+if (clipped.body.includes("rgb(0, 255, 0)") || clipped.body.includes("#00ff00")) throw new Error("mask fill should not paint");
+if (!releaseClippingMask(clipFile, [10])) throw new Error("release");
+if (clipGroup.kind.clip || clipGroup.kind.children[0].kind.clipping) throw new Error("release should stop clipping");
+console.log("clipping mask", made.id);
+
+function paintOf(color) {
+  return { items: [{ kind: "fill", paint: { type: "solid", color }, opacity: 1, visible: true }] };
+}
+function box(id, x, y, w, h, color) {
+  return { ...filledRect(id, x, y, w, h, color), appearance: paintOf(color) };
+}
+const compoundFile = {
+  document: {
+    next_id: 20,
+    artboards: [{ id: 1, rect: { x0: 0, y0: 0, x1: 200, y1: 200 } }],
+    layers: [{ id: 1, kind: { type: "layer", children: [
+      box(2, 0, 0, 100, 80, { model: "rgb", r: 1, g: 0, b: 0 }),
+      box(3, 200, 0, 10, 10, { model: "rgb", r: 0, g: 0, b: 0 }),
+      box(4, 20, 20, 30, 20, { model: "rgb", r: 0, g: 0, b: 1 }),
+      { id: 5, visible: true, kind: { type: "text", runs: [] }, appearance: paintOf({ model: "rgb", r: 0, g: 1, b: 0 }) },
+    ] } }],
+  },
+};
+const refusedCompound = makeCompoundPath(compoundFile, [2, 5]);
+if (!refusedCompound.error || compoundFile.document.layers[0].kind.children.length !== 4) throw new Error("compound should refuse text");
+const madeCompound = makeCompoundPath(compoundFile, [4, 2]);
+if (madeCompound.error) throw new Error(madeCompound.error);
+const layerAfter = compoundFile.document.layers[0].kind.children;
+if (layerAfter.map((n) => n.id).join() !== "3,20,5") throw new Error("compound replaces the front object: " + layerAfter.map((n) => n.id));
+const compound = layerAfter[1];
+if (compound.kind.type !== "compound" || compound.kind.rule !== "NonZero") throw new Error("compound kind");
+if (compound.kind.children.map((n) => n.id).join() !== "2,4") throw new Error("back path first");
+if (compound.appearance.items[0].paint.color.r !== 1) throw new Error("compound keeps the back object's paint");
+if (compound.kind.children[1].appearance.items.length) throw new Error("member paint should be cleared");
+const hole = { subpaths: compound.kind.children.map((n) => n.kind.path.subpaths[0]) };
+if (hitFill(hole, { x: 30, y: 30 }, "NonZero")) throw new Error("front path should cut a hole");
+if (!hitFill(hole, { x: 5, y: 5 }, "NonZero")) throw new Error("outside the hole should still fill");
+const compoundSvg = renderDocument(compoundFile);
+if (!compoundSvg.body.includes("rgba(255,0,0,1)") || compoundSvg.body.includes("rgba(0,0,255,1)")) throw new Error("compound should paint only the back fill");
+const released = releaseCompoundPath(compoundFile, [20]);
+if (released.ids.join() !== "2,4") throw new Error("release ids " + released.ids);
+if (compoundFile.document.layers[0].kind.children.filter((n) => n.kind.type === "path").length !== 3) throw new Error("release should restore the paths");
+const splitFile = {
+  document: {
+    next_id: 8,
+    layers: [{ id: 1, kind: { type: "layer", children: [{
+      id: 6, appearance: paintOf({ model: "rgb", r: 1, g: 1, b: 0 }),
+      kind: { type: "path", path: { subpaths: [
+        box(0, 0, 0, 10, 10, { model: "rgb", r: 0, g: 0, b: 0 }).kind.path.subpaths[0],
+        box(0, 20, 0, 10, 10, { model: "rgb", r: 0, g: 0, b: 0 }).kind.path.subpaths[0],
+      ] } },
+    }] } }],
+  },
+};
+const split = releaseCompoundPath(splitFile, [6]);
+if (split.ids[0] !== 6 || split.ids.length !== 2) throw new Error("first subpath keeps its id");
+if (splitFile.document.layers[0].kind.children.length !== 2) throw new Error("subpaths should split");
+console.log("compound path", madeCompound.id);
+
+const square = {
+  id: 1, visible: true,
+  kind: {
+    type: "path",
+    path: { subpaths: [{ closed: true, anchors: [
+      { p: { x: 0, y: 0 }, in: { x: 0, y: 0 }, out: { x: 0, y: 0 }, kind: "Corner" },
+      { p: { x: 100, y: 0 }, in: { x: 100, y: 0 }, out: { x: 100, y: 0 }, kind: "Corner" },
+      { p: { x: 100, y: 80 }, in: { x: 100, y: 80 }, out: { x: 100, y: 80 }, kind: "Corner" },
+      { p: { x: 0, y: 80 }, in: { x: 0, y: 80 }, out: { x: 0, y: 80 }, kind: "Corner" },
+    ] }] },
+    live: { shape: "rectangle", w: 100, h: 80, radii: [0, 0, 0, 0], xf: [1, 0, 0, 1, 0, 0] },
+  },
+};
+if (pathCorners(square.kind.path).length !== 4) throw new Error("rectangle should have 4 corners");
+if (Math.abs(maxRadius(pathCorners(square.kind.path)[0]) - 40) > 1e-6) throw new Error("corner max is half the shorter side");
+setLiveCorners(square, { radius: 10, corners: [1] });
+const cut = square.kind.path.subpaths[0].anchors;
+if (cut.length !== 5) throw new Error("one rounded corner is two anchors, got " + cut.length);
+if (liveCorners(square).sources[0].join() !== "0,1,1,2,3") throw new Error("corner sources " + liveCorners(square).sources[0]);
+const end = cut[1];
+if (Math.abs(end.p.x - 90) > 1e-6 || Math.abs(end.p.y) > 1e-6) throw new Error("top-right cut should meet the top at 90,0: " + JSON.stringify(end.p));
+setLiveCorners(square, { kind: "chamfer", corners: [1] });
+const chamfer = square.kind.path.subpaths[0].anchors[1];
+if (Math.abs(chamfer.in.x - chamfer.p.x) > 1e-6 || Math.abs(chamfer.in.y - chamfer.p.y) > 1e-6) throw new Error("chamfer is straight");
+const star = { id: 2, visible: true, kind: { type: "path", path: starPath(100, 100, 50, 5, 0.5) } };
+if (pathCorners(star.kind.path).length !== 10) throw new Error("star corners");
+setLiveCorners(star, { radius: 4 });
+if (star.kind.live?.shape !== "path" || star.kind.path.subpaths[0].anchors.length !== 20) throw new Error("star cuts to 20 anchors");
+setLiveCorners(star, { radius: 0 });
+if (star.kind.live) throw new Error("a path with no cut corners is plain again");
+const pie = { id: 3, visible: true, kind: { type: "path", path: ellipsePath(50, 50, 40, 20), live: { shape: "ellipse", w: 80, h: 40, pie: [0, 360], xf: [1, 0, 0, 1, 10, 30] } } };
+setEllipsePie(pie, { end: 90 });
+if (pie.kind.path.subpaths[0].anchors.length !== 3) throw new Error("quarter pie");
+if (Math.abs(pie.kind.path.subpaths[0].anchors[0].p.x - 50) > 1e-6) throw new Error("pie centre follows xf");
+const poly = { id: 4, visible: true, kind: { type: "path", path: { subpaths: [] }, live: { shape: "polygon", radius: 30, sides: 6, xf: [1, 0, 0, 1, 0, 0] } } };
+setPolygonSides(poly, 5);
+if (poly.kind.path.subpaths[0].anchors.length !== 5) throw new Error("polygon sides");
+console.log("corners", "rect", cut.length, "star plain", star.kind.path.subpaths[0].anchors.length);
+
+const a = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
+const b = [{ x: 5, y: 5 }, { x: 15, y: 5 }, { x: 15, y: 15 }, { x: 5, y: 15 }];
+const u = polygonBoolean(a, b, "union");
+const i = polygonBoolean(a, b, "intersect");
+const d = polygonBoolean(a, b, "difference");
+console.log("union rings", u.length, "pts", u[0]?.length);
+console.log("intersect", i.length, i[0]);
+console.log("difference", d.length, d.map((r) => r.length));
+
+const file = loadFile(readFileSync(new URL("../../examples/ribbons.vectorcraft", import.meta.url)));
+const svg = renderDocument(file);
+console.log("ribbons defs", svg.defs.length, "body", svg.body.length);
+console.log("has Live Blends", svg.body.includes("Live Blends"));
+console.log("path count", (svg.body.match(/<path /g) || []).length);
+
+const neon = loadFile(readFileSync(new URL("../../examples/neon-drive.vectorcraft", import.meta.url)));
+const ns = renderDocument(neon);
+console.log("neon body", ns.body.length, "text", ns.body.includes("NEON DRIVE"), "glow", ns.defs.includes("feGaussianBlur"));
+
+const font = readFileSync(new URL("../../assets/fonts/SourceSans3-Bold.ttf", import.meta.url));
+const face = parseFace(font.buffer.slice(font.byteOffset, font.byteOffset + font.byteLength));
+const outlined = outlineGlyphs(face, "NO", { size: 100, tracking: 0 }, [1, 0, 0, 1, 0, 0], "Left");
+console.log("outline glyphs", outlined.paths.length, "O contours", outlined.paths[1].subpaths.length);
+rememberFace("Source Sans 3", "Bold", face);
+
+const feat = loadFile(readFileSync(new URL("../../examples/feature-sheet.vectorcraft", import.meta.url)));
+const fs = renderDocument(feat);
+const polys = (fs.body.match(/<path /g) || []).length;
+console.log("feature body", fs.body.length, "mesh polys", polys, "WARP text", fs.body.includes(">WARP<"));
+if (fs.body.includes(">WARP<")) throw new Error("envelope left WARP as unwarped text");
+if (polys < 8000) throw new Error("mesh tessellation coarser than the desktop renderer");
+if (!fs.body.includes("Envelope Distort")) throw new Error("labels should stay as text");
+
+const warp = outlineGlyphs(face, "WARP", { size: 150, tracking: 40 }, [1, 0, 0, 1, 910, 1150], "Left");
+const src = { x0: 880, y0: 930, x1: 1340, y1: 1290 };
+const p = warp.paths[0].subpaths[0].anchors[0].p;
+const q = warpDocPoint(p, src, "flag", 45, 0, 0, true);
+const needle = `${Math.round(q.x * 1000) / 1000} ${Math.round(q.y * 1000) / 1000}`;
+console.log("warped anchor", needle, "moved", Math.hypot(q.x - p.x, q.y - p.y).toFixed(2));
+if (!fs.body.includes(needle)) throw new Error("flag warp did not bend the glyph outline");
+if (Math.hypot(q.x - p.x, q.y - p.y) < 1) throw new Error("flag bend did not move the glyph");
+
+const spin = repeatTransforms(
+  { type: "radial", instances: 12, radius: 135, center: { x: 350, y: 1090 }, startAngle: 0, endAngle: 360 },
+  { x0: 350, y0: 860, x1: 350, y1: 1050 },
+);
+if (spin.length !== 12) throw new Error("radial instances");
+const id = spin[0].every((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) < 1e-6);
+if (!id) throw new Error("source already on the radius should not slide: " + spin[0]);
+const grid = repeatTransforms(
+  { type: "grid", rows: 2, cols: 2, hSpacing: 10, vSpacing: 10 },
+  { x0: 0, y0: 0, x1: 10, y1: 10 },
+);
+if (grid.length !== 4 || Math.abs(grid[3][4] - 20) > 1e-6 || Math.abs(grid[3][5] - 20) > 1e-6) {
+  throw new Error("grid repeat: " + JSON.stringify(grid[3]));
+}
+
+const none = { type: "none" };
+const redPaint = { type: "solid", color: { model: "rgb", r: 1, g: 0, b: 0 } };
+const bluePaint = { type: "solid", color: { model: "rgb", r: 0, g: 0, b: 1 } };
+const pathFile = newFile({ title: "paths", width: 200, height: 200 });
+const openA = makePathNode(pathFile, linePath(0, 0, 40, 0), { fill: none, stroke: redPaint, strokeWidth: 8, name: "A" });
+const openB = makePathNode(pathFile, linePath(40, 0, 80, 10), { fill: none, stroke: redPaint, strokeWidth: 8, name: "B" });
+addToLayer(pathFile, openA);
+addToLayer(pathFile, openB);
+const joined = joinPaths(pathFile, [openB.id, openA.id]);
+if (joined.error) throw new Error(joined.error);
+if (joined.id !== openB.id) throw new Error("join keeps the first selected path");
+if (pathFile.document.layers[0].kind.children.some((n) => n.id === openA.id)) throw new Error("joined path should be removed");
+const joinedAnchors = openB.kind.path.subpaths[0].anchors;
+if (joinedAnchors.length !== 3 || joinedAnchors[0].p.x !== 80) throw new Error("nearest ends should meet: " + JSON.stringify(joinedAnchors.map((a) => a.p)));
+const hook = makePathNode(pathFile, linePath(10, 30, 10, 8), { fill: none, stroke: redPaint, name: "C" });
+const stem = makePathNode(pathFile, linePath(0, 0, 10, 0), { fill: none, stroke: redPaint, name: "D" });
+addToLayer(pathFile, hook);
+addToLayer(pathFile, stem);
+const joinedEnds = joinPaths(pathFile, [stem.id, hook.id]);
+if (joinedEnds.error) throw new Error(joinedEnds.error);
+const far = stem.kind.path.subpaths[0].anchors.at(-1).p;
+if (Math.abs(far.x - 10) > 1e-6 || Math.abs(far.y - 30) > 1e-6) throw new Error("join should reverse to the nearer end");
+const closedJoin = joinPaths(pathFile, [stem.id]);
+if (!stem.kind.path.subpaths[0].closed) throw new Error("one open path should close");
+const refusedJoin = joinPaths(pathFile, [stem.id]);
+if (!refusedJoin.error || !stem.kind.path.subpaths[0].closed) throw new Error("a closed path should not join again");
+const squarePath = pathFromAnchors([{ x: 0, y: 0 }, { x: 40, y: 0 }, { x: 40, y: 20 }, { x: 0, y: 20 }], true);
+const reversible = makePathNode(pathFile, squarePath, { fill: redPaint, stroke: none, name: "Square" });
+reversible.kind.live = { shape: "rectangle" };
+addToLayer(pathFile, reversible);
+const areaBefore = subpathSignedArea(reversible.kind.path.subpaths[0]);
+const reversed = reversePathDirections(pathFile, [reversible.id]);
+if (reversed.error || reversible.kind.live) throw new Error("reverse should expand the live shape");
+if (areaBefore * subpathSignedArea(reversible.kind.path.subpaths[0]) >= 0) throw new Error("reverse should flip winding");
+const textOnly = { id: 99, kind: { type: "text", runs: [] }, appearance: { items: [] } };
+pathFile.document.layers[0].kind.children.push(textOnly);
+if (!reversePathDirections(pathFile, [99]).error) throw new Error("reverse should refuse non-paths");
+
+const strokeFile = newFile({ title: "strokes", width: 200, height: 200 });
+const stroked = makePathNode(strokeFile, linePath(0, 0, 100, 0), { fill: none, stroke: redPaint, strokeWidth: 10, name: "Line" });
+stroked.appearance.effects = [{ id: "stylize.outerGlow", visible: true }];
+addToLayer(strokeFile, stroked);
+const outlinedStroke = outlineStrokes(strokeFile, [stroked.id]);
+if (outlinedStroke.error) throw new Error(outlinedStroke.error);
+if (outlinedStroke.ids[0] !== stroked.id || stroked.kind.type !== "path") throw new Error("outline should keep the path id");
+if (stroked.appearance.items.some((it) => it.kind === "stroke" && it.paint?.type !== "none")) throw new Error("outline should drop the stroke");
+if (stroked.appearance.effects[0].id !== "stylize.outerGlow") throw new Error("outline should keep effects");
+if (!hitFill(stroked.kind.path, { x: 50, y: 0 }, "NonZero")) throw new Error("outlined stroke should cover its center");
+if (hitFill(stroked.kind.path, { x: 50, y: 8 }, "NonZero")) throw new Error("outlined stroke should stay within the weight");
+const strokeSvg = renderDocument(strokeFile);
+if (!strokeSvg.body.includes("rgba(255,0,0,1)") || strokeSvg.body.includes("stroke-width")) throw new Error("outlined stroke should paint as a fill");
+const band = makePathNode(strokeFile, pathFromAnchors([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }], true), { fill: none, stroke: redPaint, strokeWidth: 10 });
+band.appearance.items.find((it) => it.kind === "stroke").align = "Center";
+addToLayer(strokeFile, band);
+outlineStrokes(strokeFile, [band.id]);
+if (hitFill(band.kind.path, { x: 50, y: 50 }, "NonZero")) throw new Error("closed stroke should leave a hole");
+if (!hitFill(band.kind.path, { x: -2, y: 50 }, "NonZero") || !hitFill(band.kind.path, { x: 2, y: 50 }, "NonZero")) throw new Error("closed stroke should paint both sides");
+const filled = makePathNode(strokeFile, linePath(0, 20, 40, 20), { fill: bluePaint, stroke: redPaint, strokeWidth: 4, name: "Both" });
+addToLayer(strokeFile, filled);
+const bothId = filled.id;
+outlineStrokes(strokeFile, [bothId]);
+if (filled.id !== bothId || filled.kind.type !== "group" || filled.kind.children.length !== 2) throw new Error("fill and stroke should become a group");
+const plain = makePathNode(strokeFile, linePath(0, 40, 10, 40), { fill: bluePaint, stroke: none });
+addToLayer(strokeFile, plain);
+const plainKind = JSON.stringify(plain.kind);
+if (!outlineStrokes(strokeFile, [plain.id]).error || JSON.stringify(plain.kind) !== plainKind) throw new Error("outline without a stroke should not change the path");
+const roundCap = strokeOutline(linePath(0, 0, 100, 0), { width: 10, cap: "Round", join: "Miter", align: "Center" });
+const buttCap = strokeOutline(linePath(0, 0, 100, 0), { width: 10, cap: "Butt", join: "Miter", align: "Center" });
+if (!hitFill(roundCap, { x: 104, y: 0 }, "NonZero") || hitFill(buttCap, { x: 101, y: 0 }, "NonZero")) throw new Error("round cap should project and butt should not");
+const dashed = strokeOutline(linePath(0, 0, 100, 0), { width: 4, cap: "Butt", join: "Miter", align: "Center", dash: { pattern: [10, 10], offset: 0 } });
+if (!hitFill(dashed, { x: 5, y: 0 }, "NonZero") || hitFill(dashed, { x: 15, y: 0 }, "NonZero")) throw new Error("dashes should leave gaps");
+const ribbonsAgain = renderDocument(file);
+if (ribbonsAgain.defs.length !== 312 || ribbonsAgain.body.length !== 98503) throw new Error("ribbons changed " + ribbonsAgain.defs.length + " " + ribbonsAgain.body.length);
+console.log("path join", joined.id);
+
+const repeatFile = newFile({ title: "repeats", width: 400, height: 400 });
+const repeatBack = makeRect(repeatFile, 0, 80, 8, 8, { fill: { type: "solid", color: { model: "rgb", r: 0, g: 0, b: 0 } }, stroke: { type: "none" } });
+const repeatA = makeRect(repeatFile, 10, 10, 20, 10, { fill: { type: "solid", color: { model: "rgb", r: 1, g: 0, b: 0 } }, stroke: { type: "none" } });
+const repeatB = makeRect(repeatFile, 40, 10, 20, 10, { fill: { type: "solid", color: { model: "rgb", r: 0, g: 0, b: 1 } }, stroke: { type: "none" } });
+addToLayer(repeatFile, repeatBack);
+addToLayer(repeatFile, repeatA);
+addToLayer(repeatFile, repeatB);
+const refusedRepeat = makeRepeat(repeatFile, [], "radial");
+if (!refusedRepeat.error || repeatFile.document.layers[0].kind.children.length !== 3) throw new Error("repeat should refuse an empty selection");
+const madeRepeat = makeRepeat(repeatFile, [repeatB.id, repeatA.id], "radial");
+if (madeRepeat.error) throw new Error(madeRepeat.error);
+const repeatLayer = repeatFile.document.layers[0].kind.children;
+if (repeatLayer.map((n) => n.id).join() !== `${repeatBack.id},${madeRepeat.id}`) throw new Error("repeat replaces the front object: " + repeatLayer.map((n) => n.id));
+const repeatNode = repeatLayer[1];
+if (repeatNode.kind.type !== "repeat" || repeatNode.kind.kind.type !== "radial" || repeatNode.kind.kind.instances !== 8) throw new Error("radial defaults");
+if (repeatNode.kind.source.map((n) => n.id).join() !== `${repeatA.id},${repeatB.id}`) throw new Error("source stays in paint order");
+if (Math.abs(repeatNode.kind.kind.radius - 60) > 1e-6 || Math.abs(repeatNode.kind.kind.center.y - 75) > 1e-6) throw new Error("radius sits below the art: " + JSON.stringify(repeatNode.kind.kind));
+const repeatBox = nodeBounds(repeatNode);
+if (!repeatBox || repeatBox.y1 < 100 || repeatBox.x0 > 10) throw new Error("repeat bounds should include the copies: " + JSON.stringify(repeatBox));
+const repeatSvg = renderDocument(repeatFile);
+if ((repeatSvg.body.match(/matrix\(/g) || []).length !== 8) throw new Error("radial repeat should paint 8 instances");
+const repeatKind = JSON.stringify(repeatNode.kind.kind);
+if (!makeRepeat(repeatFile, [repeatNode.id], "radial", { instances: 0 }).error || JSON.stringify(repeatNode.kind.kind) !== repeatKind) throw new Error("bad instance count should not switch the repeat");
+const switchedRepeat = makeRepeat(repeatFile, [repeatNode.id], "grid");
+if (switchedRepeat.id !== repeatNode.id || repeatNode.kind.kind.type !== "grid" || repeatNode.kind.kind.rows !== 3) throw new Error("a selected repeat switches kind");
+if (Math.abs(repeatNode.kind.kind.hSpacing - 12.5) > 1e-6) throw new Error("grid spacing is a quarter of the art");
+const repeatOpt = writeRepeatOptions(repeatNode, { rows: 2, cols: 4, gridType: "brickByRow", flipCols: true });
+if (repeatOpt.error || repeatNode.kind.kind.cols !== 4 || repeatNode.kind.kind.gridType.type !== "brickByRow" || !repeatNode.kind.kind.flipCols) throw new Error("repeat options");
+if (!writeRepeatOptions(repeatNode, { rows: 0 }).error || repeatNode.kind.kind.rows !== 2) throw new Error("bad rows should not stick");
+if (readRepeatOptions(repeatNode).type !== "grid") throw new Error("read repeat options");
+const mirrorRepeat = makeRepeat(repeatFile, [repeatNode.id], "mirror");
+if (mirrorRepeat.error || repeatNode.kind.kind.angle !== 90) throw new Error("mirror axis");
+const mirrorSvg = renderDocument(repeatFile);
+if ((mirrorSvg.body.match(/matrix\(/g) || []).length !== 2) throw new Error("mirror paints the source and its reflection");
+makeRepeat(repeatFile, [repeatNode.id], "radial", { instances: 4 });
+const expandedRepeat = expandRepeat(repeatFile, [repeatNode.id]);
+if (expandedRepeat.ids[0] !== repeatNode.id || repeatNode.kind.type !== "group" || repeatNode.kind.children.length !== 4) throw new Error("expand keeps the id and one group per instance");
+if (repeatFile.document.layers[0].kind.children.some((n) => n.id === repeatA.id)) throw new Error("expand should replace the source with copies");
+const repeatAgain = newFile({ width: 200, height: 200 });
+const once = makeRect(repeatAgain, 0, 0, 10, 10, { fill: { type: "solid", color: { model: "rgb", r: 1, g: 0, b: 0 } }, stroke: { type: "none" } });
+addToLayer(repeatAgain, once);
+const held = makeRepeat(repeatAgain, [once.id], "radial", { instances: 5 });
+const releasedRepeat = releaseRepeat(repeatAgain, [held.id]);
+if (releasedRepeat.ids.join() !== String(once.id) || repeatAgain.document.layers[0].kind.children[0].id !== once.id) throw new Error("release restores the source");
+const scaledRepeat = newFile({ width: 200, height: 200 });
+const scaledBit = makeRect(scaledRepeat, 0, 0, 10, 10, { fill: { type: "solid", color: { model: "rgb", r: 1, g: 0, b: 0 } }, stroke: { type: "none" } });
+addToLayer(scaledRepeat, scaledBit);
+makeRepeat(scaledRepeat, [scaledBit.id], "radial", { instances: 4, radius: 20 });
+const scaledNode = scaledRepeat.document.layers[0].kind.children[0];
+transformNode(scaledNode, [2, 0, 0, 2, 0, 0]);
+if (Math.abs(scaledNode.kind.kind.radius - 40) > 1e-6 || Math.abs(scaledNode.kind.kind.center.y - 50) > 1e-6) throw new Error("scaling a repeat scales its radius and center");
+console.log("repeat", madeRepeat.id);
