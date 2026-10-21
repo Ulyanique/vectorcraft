@@ -3,8 +3,8 @@ import { polygonBoolean } from "./bool.js";
 import { expandBlend, renderDocument, repeatTransforms } from "./render.js";
 import { addSpineAnchor, blendSpine, moveSpineAnchor, readBlendOptions, removeSpineAnchor, stepsBetween, writeBlendOptions } from "./blend.js";
 import { applyRecolor, artworkColors, cluster, colorFromKey, colorKey, keepsNeutral, mapColor, neutralOf, reduceColors, tinted } from "./recolor.js";
-import { clipEditTargets, loadFile, makeClippingMask, releaseClippingMask } from "./model.js";
-import { ellipsePath, pathD, starPath, toRgb, warpDocPoint } from "./geom.js";
+import { clipEditTargets, loadFile, makeClippingMask, makeCompoundPath, releaseClippingMask, releaseCompoundPath } from "./model.js";
+import { ellipsePath, hitFill, pathD, starPath, toRgb, warpDocPoint } from "./geom.js";
 import { liveCorners, maxRadius, pathCorners, setEllipsePie, setLiveCorners, setPolygonSides } from "./corners.js";
 import { addLinesAt, locateMesh, meshFromPath, meshLinesPath, moveMeshPoint, pointNear, removePointLines } from "./mesh.js";
 import { parseFace, outlineGlyphs, rememberFace } from "./outlines.js";
@@ -232,6 +232,60 @@ if (clipped.body.includes("rgb(0, 255, 0)") || clipped.body.includes("#00ff00"))
 if (!releaseClippingMask(clipFile, [10])) throw new Error("release");
 if (clipGroup.kind.clip || clipGroup.kind.children[0].kind.clipping) throw new Error("release should stop clipping");
 console.log("clipping mask", made.id);
+
+function paintOf(color) {
+  return { items: [{ kind: "fill", paint: { type: "solid", color }, opacity: 1, visible: true }] };
+}
+function box(id, x, y, w, h, color) {
+  return { ...filledRect(id, x, y, w, h, color), appearance: paintOf(color) };
+}
+const compoundFile = {
+  document: {
+    next_id: 20,
+    artboards: [{ id: 1, rect: { x0: 0, y0: 0, x1: 200, y1: 200 } }],
+    layers: [{ id: 1, kind: { type: "layer", children: [
+      box(2, 0, 0, 100, 80, { model: "rgb", r: 1, g: 0, b: 0 }),
+      box(3, 200, 0, 10, 10, { model: "rgb", r: 0, g: 0, b: 0 }),
+      box(4, 20, 20, 30, 20, { model: "rgb", r: 0, g: 0, b: 1 }),
+      { id: 5, visible: true, kind: { type: "text", runs: [] }, appearance: paintOf({ model: "rgb", r: 0, g: 1, b: 0 }) },
+    ] } }],
+  },
+};
+const refusedCompound = makeCompoundPath(compoundFile, [2, 5]);
+if (!refusedCompound.error || compoundFile.document.layers[0].kind.children.length !== 4) throw new Error("compound should refuse text");
+const madeCompound = makeCompoundPath(compoundFile, [4, 2]);
+if (madeCompound.error) throw new Error(madeCompound.error);
+const layerAfter = compoundFile.document.layers[0].kind.children;
+if (layerAfter.map((n) => n.id).join() !== "3,20,5") throw new Error("compound replaces the front object: " + layerAfter.map((n) => n.id));
+const compound = layerAfter[1];
+if (compound.kind.type !== "compound" || compound.kind.rule !== "NonZero") throw new Error("compound kind");
+if (compound.kind.children.map((n) => n.id).join() !== "2,4") throw new Error("back path first");
+if (compound.appearance.items[0].paint.color.r !== 1) throw new Error("compound keeps the back object's paint");
+if (compound.kind.children[1].appearance.items.length) throw new Error("member paint should be cleared");
+const hole = { subpaths: compound.kind.children.map((n) => n.kind.path.subpaths[0]) };
+if (hitFill(hole, { x: 30, y: 30 }, "NonZero")) throw new Error("front path should cut a hole");
+if (!hitFill(hole, { x: 5, y: 5 }, "NonZero")) throw new Error("outside the hole should still fill");
+const compoundSvg = renderDocument(compoundFile);
+if (!compoundSvg.body.includes("rgba(255,0,0,1)") || compoundSvg.body.includes("rgba(0,0,255,1)")) throw new Error("compound should paint only the back fill");
+const released = releaseCompoundPath(compoundFile, [20]);
+if (released.ids.join() !== "2,4") throw new Error("release ids " + released.ids);
+if (compoundFile.document.layers[0].kind.children.filter((n) => n.kind.type === "path").length !== 3) throw new Error("release should restore the paths");
+const splitFile = {
+  document: {
+    next_id: 8,
+    layers: [{ id: 1, kind: { type: "layer", children: [{
+      id: 6, appearance: paintOf({ model: "rgb", r: 1, g: 1, b: 0 }),
+      kind: { type: "path", path: { subpaths: [
+        box(0, 0, 0, 10, 10, { model: "rgb", r: 0, g: 0, b: 0 }).kind.path.subpaths[0],
+        box(0, 20, 0, 10, 10, { model: "rgb", r: 0, g: 0, b: 0 }).kind.path.subpaths[0],
+      ] } },
+    }] } }],
+  },
+};
+const split = releaseCompoundPath(splitFile, [6]);
+if (split.ids[0] !== 6 || split.ids.length !== 2) throw new Error("first subpath keeps its id");
+if (splitFile.document.layers[0].kind.children.length !== 2) throw new Error("subpaths should split");
+console.log("compound path", madeCompound.id);
 
 const square = {
   id: 1, visible: true,

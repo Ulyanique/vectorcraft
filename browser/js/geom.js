@@ -281,6 +281,17 @@ export function hitStroke(path, p, width) {
   return false;
 }
 
+function ringWinding(p, ring) {
+  let w = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[j], b = ring[i];
+    const cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    if (a.y <= p.y) { if (b.y > p.y && cross > 0) w++; }
+    else if (b.y <= p.y && cross < 0) w--;
+  }
+  return w;
+}
+
 export function hitFill(path, p, rule) {
   const rings = flattenPath(path, 0.8).filter((r) => r.closed && r.pts.length > 2);
   if (!rings.length) return false;
@@ -289,9 +300,41 @@ export function hitFill(path, p, rule) {
     for (const r of rings) if (pointInRing(p, r.pts)) w++;
     return w % 2 === 1;
   }
-  // NonZero approximated by odd-even of the outer-most; good enough for typical art.
-  for (const r of rings) if (pointInRing(p, r.pts)) return true;
-  return false;
+  let w = 0;
+  for (const r of rings) w += ringWinding(p, r.pts);
+  return w !== 0;
+}
+
+/** Signed area of a subpath. Positive when it runs clockwise on screen (y down). */
+export function subpathSignedArea(sp) {
+  const anchors = sp?.anchors || [];
+  if (anchors.length < 2) return 0;
+  const pts = [anchors[0].p];
+  const segs = sp.closed ? anchors.length : Math.max(0, anchors.length - 1);
+  for (let i = 0; i < segs; i++) {
+    const a = anchors[i], b = anchors[(i + 1) % anchors.length];
+    if (!a?.p || !b?.p) continue;
+    if (same(a.p, a.out || a.p) && same(b.in || b.p, b.p)) pts.push(b.p);
+    else for (let t = 1; t <= 8; t++) pts.push(cubic(a.p, a.out || a.p, b.in || b.p, b.p, t / 8));
+  }
+  if (!sp.closed) pts.push(anchors[0].p);
+  let area = 0;
+  for (let i = 0; i < pts.length - 1; i++) area += pts[i].x * pts[i + 1].y - pts[i + 1].x * pts[i].y;
+  return area / 2;
+}
+
+/** Reverse every subpath, swapping handles so the curve stays the same shape. */
+export function reversePath(path) {
+  for (const sp of path?.subpaths || []) {
+    const anchors = sp.anchors || [];
+    anchors.reverse();
+    for (const a of anchors) {
+      const inn = a.in;
+      a.in = a.out;
+      a.out = inn;
+    }
+  }
+  return path;
 }
 
 export function translatePath(path, dx, dy) {

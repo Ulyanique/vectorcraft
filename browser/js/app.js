@@ -7,7 +7,7 @@ import {
   activeLayer, addToLayer, alignNodes, allocId, artboardBounds, blankNode, childrenOf, collectTop,
   deepClone, defaultAppearance, duplicateNodes, groupNodes, hideNodes, indexNodes, loadFile, lockNodes,
   makeEllipse, makeLine, makePathNode, makePolygon, makeRect, makeStar, makeText, newFile,
-  clipEditTargets, makeClippingMask, nodeBounds, nonePaint, objectLabel, primaryFill, primaryStroke, releaseClippingMask, removeNodes, reorder,
+  clipEditTargets, makeClippingMask, makeCompoundPath, nodeBounds, nonePaint, objectLabel, primaryFill, primaryStroke, releaseClippingMask, releaseCompoundPath, removeNodes, reorder,
   restore, selectionBounds, setBlend, setOpacity, setPaint, setText, showAll, snapshot,
   solid, textOf, translateNode, transformNode, ungroup, unlockAll, fillsOf,
 } from "./model.js";
@@ -978,6 +978,20 @@ function hitDeep(nodes, p) {
   return null;
 }
 
+function compoundHit(node, p) {
+  const subs = [];
+  for (const c of node.kind?.children || []) {
+    if (c.kind?.path) subs.push(...c.kind.path.subpaths);
+    else if (c.kind?.type === "compound") {
+      for (const cc of c.kind.children || []) if (cc.kind?.path) subs.push(...cc.kind.path.subpaths);
+    }
+  }
+  const path = { subpaths: subs };
+  const stroke = primaryStroke(node);
+  const width = stroke?.width || 0;
+  return hitFill(path, p, node.kind?.rule || "NonZero") || (width > 0 && hitStroke(path, p, width)) || hitStroke(path, p, 3);
+}
+
 function hitSelect(nodes, p) {
   if (!nodes) return null;
   for (let i = nodes.length - 1; i >= 0; i--) {
@@ -990,9 +1004,13 @@ function hitSelect(nodes, p) {
       if (hitDeep(childrenOf(n), p) || (mask && hitsGeometry(mask, p))) return n;
       continue;
     }
-    if (t === "group" || t === "blend" || t === "repeat" || t === "envelope" || t === "compound") {
+    if (t === "compound") {
+      if (compoundHit(n, p)) return n;
+      continue;
+    }
+    if (t === "group" || t === "blend" || t === "repeat" || t === "envelope") {
       const inner = hitDeep(childrenOf(n), p) || (t === "blend" && blendHit(n, p) ? n : null);
-      if (inner) return t === "compound" ? n : (t === "group" ? n : n);
+      if (inner) return n;
     } else if (hitsGeometry(n, p)) return n;
   }
   return null;
@@ -1434,6 +1452,36 @@ const commands = {
     d.dirty = true;
     layersApi()?.clearThumbs();
     d.selection = [result.id];
+    paint();
+    refreshChrome();
+  },
+  makeCompoundPath: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const result = makeCompoundPath(d.file, d.selection);
+    if (result.error) { toast(result.error); return; }
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    d.selection = [result.id];
+    paint();
+    refreshChrome();
+  },
+  releaseCompoundPath: () => {
+    const d = doc();
+    if (!d) return;
+    const before = snapshot(d.file);
+    const result = releaseCompoundPath(d.file, d.selection);
+    if (!result.ids.length) return;
+    d.history.push(before);
+    if (d.history.length > 80) d.history.shift();
+    d.future = [];
+    d.dirty = true;
+    layersApi()?.clearThumbs();
+    d.selection = result.ids;
     paint();
     refreshChrome();
   },
@@ -3496,6 +3544,10 @@ function menuItems(name) {
         { label: "Edit Contents", cmd: "editClipContents" },
         { label: "Edit Clipping Path", cmd: "editClipMask" },
       ] },
+      { label: "Compound Path", items: [
+        { label: "Make", cmd: "makeCompoundPath", sc: "Ctrl+8" },
+        { label: "Release", cmd: "releaseCompoundPath", sc: "Ctrl+Alt+Shift+8" },
+      ] },
       { label: "Pathfinder", items: [
         { label: "Unite", cmd: "pathfinderUnite" },
         { label: "Minus Front", cmd: "pathfinderMinus" },
@@ -3846,7 +3898,8 @@ function drawTaskbar() {
   el.innerHTML = `
     <i class="grip" id="task-grip" title="Drag"></i>
     ${isText ? `<button class="act" data-cmd="createOutlines">${icon("type", 14)} Create Outlines</button>` : ""}
-    ${n.length > 1 ? `<button class="act" data-cmd="makeClippingMask">${icon("rectangle", 14)} Make Clipping Mask</button>` : ""}
+    ${n.length > 1 ? `<button class="act" data-cmd="makeClippingMask">${icon("rectangle", 14)} Make Clipping Mask</button><button class="act" data-cmd="makeCompoundPath">${icon("pathfinder", 14)} Compound Path</button>` : ""}
+    ${n.some((node) => node.kind?.type === "compound" || (node.kind?.path?.subpaths?.length || 0) > 1) ? `<button class="act" data-cmd="releaseCompoundPath">${icon("pathfinder", 14)} Release</button>` : ""}
     ${selectedBlends().length ? `<button class="act" data-cmd="blendOptions">${icon("blend", 14)} Blend Options</button>` : ""}
     ${isPath && n.length === 1 ? `<button class="act" data-cmd="offsetPath">${icon("rectangle", 14)} Offset Path</button><button class="act" data-cmd="simplify">${icon("curvature", 14)} Simplify</button>` : ""}
     <button class="act" data-cmd="duplicate">${icon("copy", 14)} Duplicate</button>
@@ -4207,7 +4260,7 @@ function propertiesHTML(n, nodes) {
   </div>
   <div class="psec"><h3>Quick Actions</h3>
     <div class="qa">
-      ${nodes.length > 1 ? `<button class="btn" data-cmd="group">Group</button><button class="btn" data-cmd="makeClippingMask">Make Clipping Mask</button>` : ""}
+      ${nodes.length > 1 ? `<button class="btn" data-cmd="group">Group</button><button class="btn" data-cmd="makeClippingMask">Make Clipping Mask</button><button class="btn" data-cmd="makeCompoundPath">Compound Path</button>` : ""}
       ${nodes[0]?.kind?.type === "group" ? `<button class="btn" data-cmd="ungroup">Ungroup</button>` : ""}
       ${nodes[0]?.kind?.live ? `<button class="btn" data-cmd="expandShape">Expand Shape</button>` : ""}
       ${selectedBlends().length ? `<button class="btn" data-cmd="blendOptions">Blend Options…</button>` : ""}
@@ -4930,12 +4983,17 @@ function onKey(e) {
     commands.releaseClippingMask();
     return;
   }
+  if ((e.metaKey || e.ctrlKey) && e.altKey && e.shiftKey && e.key === "8") {
+    e.preventDefault();
+    commands.releaseCompoundPath();
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && !e.altKey) {
     const k = e.key.toLowerCase();
     const map = {
       z: e.shiftKey ? "redo" : "undo", y: "redo", s: "save", o: "open", n: "new", e: "exportSVG",
       a: e.shiftKey ? "deselect" : "selectAll", c: "copy", x: "cut", v: e.shiftKey ? "pasteInPlace" : "paste",
-      d: "duplicate", g: e.shiftKey ? "ungroup" : "group", w: "close", "7": "makeClippingMask",
+      d: "duplicate", g: e.shiftKey ? "ungroup" : "group", w: "close", "7": "makeClippingMask", "8": e.shiftKey ? null : "makeCompoundPath",
       "0": "fitArtboard", "1": "actualSize", "=": "zoomIn", "+": "zoomIn", "-": "zoomOut",
       k: "palette", y: e.shiftKey ? null : "toggleOutline", r: "toggleRulers",
     };

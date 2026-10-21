@@ -2,7 +2,7 @@
 
 import {
   applyXf, boundsOf, ellipsePath, ident, include, linePath, mulXf, pathBounds, pathFromAnchors,
-  polygonPath, rotateXf, scaleXf, starPath, subpathBounds, transformPath, translatePath, translateXf, union,
+  polygonPath, reversePath, rotateXf, scaleXf, starPath, subpathBounds, subpathSignedArea, transformPath, translatePath, translateXf, union,
 } from "./geom.js";
 import { measureWidth, metricsFor, typoBox } from "./fontmetrics.js";
 
@@ -539,6 +539,142 @@ export function clipEditTargets(file, ids, mask) {
     }
   }
   return [...new Set(out)];
+}
+
+function paintOrderIds(file, ids) {
+  const want = new Set(ids);
+  const out = [];
+  const visit = (node) => {
+    if (!node) return;
+    if (want.has(node.id)) out.push(node.id);
+    for (const c of childrenOf(node) || []) visit(c);
+  };
+  for (const layer of file.document?.layers || []) visit(layer);
+  return out;
+}
+
+/** Selected objects in paint order, as compound-path commands see them. */
+function compoundRoots(file, ids) {
+  const { map, parent } = indexNodes(file);
+  const promoted = [];
+  const seen = new Set();
+  for (const id of paintOrderIds(file, ids)) {
+    let node = map.get(id);
+    const par = parent.get(id);
+    if (par?.kind?.type === "compound") node = par;
+    if (!node || seen.has(node.id) || node.kind?.type === "layer") continue;
+    seen.add(node.id);
+    promoted.push(node);
+  }
+  return promoted.filter((node) => {
+    let p = parent.get(node.id);
+    while (p) {
+      if (seen.has(p.id)) return false;
+      p = parent.get(p.id);
+    }
+    return true;
+  });
+}
+
+function pathSign(node) {
+  const area = subpathSignedArea(node?.kind?.path?.subpaths?.[0]);
+  return area > 1e-6 ? 1 : area < -1e-6 ? -1 : 0;
+}
+
+function pathsUnder(node, out) {
+  for (const c of childrenOf(node) || []) {
+    if (c.kind?.type === "path") out.push(c);
+    else pathsUnder(c, out);
+  }
+}
+
+function placeWrapped(file, roots, node) {
+  const { parent } = indexNodes(file);
+  const anchor = roots[roots.length - 1];
+  const par = parent.get(anchor.id);
+  const list = childrenOf(par);
+  if (!list) return;
+  const anchorIndex = list.indexOf(anchor);
+  const below = roots.filter((n) => parent.get(n.id) === par && list.indexOf(n) >= 0 && list.indexOf(n) < anchorIndex).length;
+  const grouped = new Map();
+  for (const n of roots) {
+    const p = parent.get(n.id);
+    if (!grouped.has(p)) grouped.set(p, []);
+    grouped.get(p).push(n);
+  }
+  for (const [p, nodes] of grouped) {
+    const kids = childrenOf(p);
+    if (!kids) continue;
+    for (const n of nodes) {
+      const i = kids.indexOf(n);
+      if (i >= 0) kids.splice(i, 1);
+    }
+  }
+  childrenOf(par).splice(Math.max(0, Math.min(anchorIndex - below, childrenOf(par).length)), 0, node);
+}
+
+/** The backmost selected object paints the compound; paths in front cut holes. */
+export function makeCompoundPath(file, ids) {
+  const roots = compoundRoots(file, ids);
+  if (!roots.length) return { error: "Select an object" };
+  for (const n of roots) {
+    const t = n.kind?.type;
+    if (t !== "path" && t !== "compound" && t !== "group") return { error: "Compound paths can only contain paths" };
+  }
+  const paths = [];
+  for (const n of roots) {
+    if (n.kind.type === "path") paths.push(n);
+    else if (n.kind.type === "compound") paths.push(...(n.kind.children || []));
+    else pathsUnder(n, paths);
+  }
+  const appearance = deepClone(roots[0].appearance || { items: [] });
+  const backSign = pathSign(paths[0]);
+  paths.forEach((p, i) => {
+    p.appearance = { items: [] };
+    if (p.kind?.type !== "path") return;
+    if (p.kind.live) delete p.kind.live;
+    if (i > 0 && backSign !== 0 && pathSign(p) === backSign) reversePath(p.kind.path);
+  });
+  const compound = blankNode(allocId(file), { type: "compound", children: paths, rule: "NonZero" }, appearance);
+  placeWrapped(file, roots, compound);
+  return { id: compound.id };
+}
+
+function releasesCompound(node) {
+  if (node?.kind?.type === "compound") return true;
+  return node?.kind?.type === "path" && (node.kind.path?.subpaths?.length || 0) > 1;
+}
+
+/** Compound paths become their paths; a path of several subpaths splits, the first keeping its id. */
+export function releaseCompoundPath(file, ids) {
+  const roots = compoundRoots(file, ids).filter(releasesCompound);
+  if (!roots.length) return { ids: [] };
+  const { parent } = indexNodes(file);
+  const out = [];
+  for (const n of roots) {
+    const parts = [];
+    if (n.kind.type === "compound") {
+      for (const c of n.kind.children || []) {
+        c.appearance = deepClone(n.appearance || { items: [] });
+        parts.push(c);
+        out.push(c.id);
+      }
+    } else {
+      const subs = n.kind.path.subpaths || [];
+      subs.forEach((sp, k) => {
+        const c = k === 0 ? n : deepClone(n);
+        if (k !== 0) c.id = allocId(file);
+        c.kind = { ...c.kind, type: "path", path: { subpaths: [deepClone(sp)] } };
+        if (c.kind.live) delete c.kind.live;
+        parts.push(c);
+        out.push(c.id);
+      });
+    }
+    const list = childrenOf(parent.get(n.id));
+    const at = list?.indexOf(n) ?? -1;
+    if (at >= 0) list.splice(at, 1, ...parts);
+  }
+  return { ids: out };
 }
 
 export function ungroup(file, ids) {
